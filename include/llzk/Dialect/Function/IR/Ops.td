@@ -37,7 +37,8 @@ class FunctionDialectOp<string mnemonic, list<Trait> traits = []>
 def FuncDefOp
     : FunctionDialectOp<
           "def",
-          [ParentOneOf<["::mlir::ModuleOp", "::llzk::component::StructDefOp"]>,
+          [ParentOneOf<["::mlir::ModuleOp", "::llzk::component::StructDefOp",
+                        "::llzk::polymorphic::TemplateOp"]>,
            DeclareOpInterfaceMethods<SymbolUserOpInterface>, AffineScope,
            AutomaticAllocationScope, FunctionOpInterface, IsolatedFromAbove]> {
   // NOTE: Cannot have SymbolTable trait because that would cause global
@@ -300,6 +301,11 @@ def CallOp : FunctionDialectOp<
       SymbolRefAttr:$callee,
       // List of arguments to call the target function.
       Variadic<AnyLLZKType>:$argOperands,
+      // List of parameters to instantiate all `poly.param` symbols when the
+      // callee is a free function inside a `poly.template` region. If all
+      // `poly.param` symbols are used within the function signature, this can
+      // be elided. Otherwise, it is required to instantiate the function.
+      OptionalAttr<ArrayAttr>:$templateParams,
       // List of AffineMap operand groups where each group provides the
       // arguments to instantiate the next (left-to-right) AffineMap used as a
       // struct parameter in the result StructType.
@@ -313,7 +319,9 @@ def CallOp : FunctionDialectOp<
   let results = (outs Variadic<AnyLLZKType>);
 
   let assemblyFormat = [{
-    $callee `(` $argOperands `)`
+    $callee
+    ( `<` custom<TemplateParams>($templateParams)^ `>` )?
+    `` `(` $argOperands `)`
     ( `{` custom<MultiDimAndSymbolList>($mapOperands, $numDimsPerMap)^ `}` )?
     `:` functional-type($argOperands, results)
     custom<AttrDictWithWarnings>(attr-dict, prop-dict)
@@ -332,42 +340,56 @@ def CallOp : FunctionDialectOp<
   let builders =
       [OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
            "::mlir::SymbolRefAttr":$callee,
-           CArg<"::mlir::ValueRange", "{}">:$argOperands)>,
+           CArg<"::mlir::ValueRange", "{}">:$argOperands,
+           CArg<"::llvm::ArrayRef<::mlir::Attribute>", "{}">:$templateParams)>,
        OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
            "::mlir::SymbolRefAttr":$callee,
            "::llvm::ArrayRef<::mlir::ValueRange>":$mapOperands,
            "::mlir::DenseI32ArrayAttr":$numDimsPerMap,
-           CArg<"::mlir::ValueRange", "{}">:$argOperands)>,
+           CArg<"::mlir::ValueRange", "{}">:$argOperands,
+           CArg<"::llvm::ArrayRef<::mlir::Attribute>", "{}">:$templateParams)>,
        OpBuilder<(ins "::mlir::TypeRange":$resultTypes,
                      "::mlir::SymbolRefAttr":$callee,
                      "::llvm::ArrayRef<::mlir::ValueRange>":$mapOperands,
                      "::llvm::ArrayRef<int32_t>":$numDimsPerMap,
-                     CArg<"::mlir::ValueRange", "{}">:$argOperands),
+                     CArg<"::mlir::ValueRange", "{}">:$argOperands,
+                     CArg<"::llvm::ArrayRef<::mlir::Attribute>",
+                          "{}">:$templateParams),
                  [{
                     build($_builder, $_state, resultTypes, callee, mapOperands,
-                          $_builder.getDenseI32ArrayAttr(numDimsPerMap), argOperands);
+                          $_builder.getDenseI32ArrayAttr(numDimsPerMap),
+                          argOperands, templateParams);
                   }]>,
        OpBuilder<(ins "::llzk::function::FuncDefOp":$callee,
-                     CArg<"::mlir::ValueRange", "{}">:$argOperands),
+                     CArg<"::mlir::ValueRange", "{}">:$argOperands,
+                     CArg<"::llvm::ArrayRef<::mlir::Attribute>",
+                          "{}">:$templateParams),
                  [{
                     build($_builder, $_state, callee.getResultTypes(),
-                          callee.getFullyQualifiedName(false), argOperands);
+                          callee.getFullyQualifiedName(false),
+                          argOperands, templateParams);
                   }]>,
        OpBuilder<(ins "::llzk::function::FuncDefOp":$callee,
                      "::llvm::ArrayRef<::mlir::ValueRange>":$mapOperands,
                      "::mlir::DenseI32ArrayAttr":$numDimsPerMap,
-                     CArg<"::mlir::ValueRange", "{}">:$argOperands),
+                     CArg<"::mlir::ValueRange", "{}">:$argOperands,
+                     CArg<"::llvm::ArrayRef<::mlir::Attribute>",
+                          "{}">:$templateParams),
                  [{
                     build($_builder, $_state, callee.getResultTypes(),
-                          callee.getFullyQualifiedName(false), mapOperands, numDimsPerMap, argOperands);
+                          callee.getFullyQualifiedName(false), mapOperands, numDimsPerMap,
+                          argOperands, templateParams);
                   }]>,
        OpBuilder<(ins "::llzk::function::FuncDefOp":$callee,
                      "::llvm::ArrayRef<::mlir::ValueRange>":$mapOperands,
                      "::llvm::ArrayRef<int32_t>":$numDimsPerMap,
-                     CArg<"::mlir::ValueRange", "{}">:$argOperands),
+                     CArg<"::mlir::ValueRange", "{}">:$argOperands,
+                     CArg<"::llvm::ArrayRef<::mlir::Attribute>",
+                          "{}">:$templateParams),
                  [{
                     build($_builder, $_state, callee, mapOperands,
-                          $_builder.getDenseI32ArrayAttr(numDimsPerMap), argOperands);
+                          $_builder.getDenseI32ArrayAttr(numDimsPerMap),
+                          argOperands, templateParams);
                   }]>];
 
   let extraClassDeclaration = [{
@@ -431,6 +453,35 @@ def CallOp : FunctionDialectOp<
     /// Allocate consecutive storage of the ValueRange instances in the parameter
     /// so it can be passed to the builders as an `ArrayRef<ValueRange>`.
     static ::llvm::SmallVector<::mlir::ValueRange> toVectorOfValueRange(::mlir::OperandRangeRange);
+
+    /// Check type compatibility of the given template parameter value from this `CallOp` against
+    /// the declared type on the given `TemplateParamOp` (if any).
+    ::mlir::LogicalResult verifyTemplateParamCompatibility(
+      ::mlir::Attribute paramFromCallOp, ::llzk::polymorphic::TemplateParamOp targetParam
+    );
+
+    /// Check type compatibility of each template parameter value provided in this `CallOp` against
+    /// the declared type on each `TemplateParamOp` (if any).
+    ///
+    /// Pre-condition assertions:
+    ///   - `!isNullOrEmpty(getTemplateParamsAttr())`
+    ///   - `getTemplateParamsAttr().size() == llvm::range_size(targetParamDefs)`
+    ::mlir::LogicalResult verifyTemplateParamCompatibility(
+        ::llvm::iterator_range<::mlir::Region::op_iterator<::llzk::polymorphic::TemplateParamOp>> targetParamDefs
+    );
+
+    /// Verify that each template parameter value provided in this `CallOp` is consistent with
+    /// the value inferred for the target `TemplateParamOp` in the given `UnificationMap`. The
+    /// `UnificationMap` is expected to contain the unification results of this `CallOp` against
+    /// the target function type signature.
+    ///
+    /// Pre-condition assertions:
+    ///   - `!isNullOrEmpty(getTemplateParamsAttr())`
+    ///   - `getTemplateParamsAttr().size() == llvm::range_size(targetParamDefs)`
+    ::mlir::LogicalResult verifyTemplateParamsMatchInferred(
+        ::llvm::iterator_range<::mlir::Region::op_iterator<::llzk::polymorphic::TemplateParamOp>> targetParamDefs,
+        const UnificationMap &unifications
+    );
   }];
 }
 

@@ -126,8 +126,30 @@ const char *llzkStruct_StructDefOpGetHeaderString(
   return dst;
 }
 
-bool llzkStruct_StructDefOpHasParamName(MlirOperation op, MlirStringRef name) {
-  return llvm::cast<StructDefOp>(unwrap(op)).hasParamNamed(unwrap(name));
+void llzkStruct_StructDefOpGetTemplateParamOpNames(MlirOperation op, MlirAttribute *dst) {
+  for (auto [offset, attr] :
+       llvm::enumerate(llvm::cast<StructDefOp>(unwrap(op)).getTemplateParamOpNames())) {
+    dst[offset] = wrap(attr);
+  }
+}
+
+intptr_t llzkStruct_StructDefOpGetNumTemplateParamOpNames(MlirOperation op) {
+  return llzk::checkedCast<intptr_t>(
+      llvm::cast<StructDefOp>(unwrap(op)).getTemplateParamOpNames().size()
+  );
+}
+
+void llzkStruct_StructDefOpGetTemplateExprOpNames(MlirOperation op, MlirAttribute *dst) {
+  for (auto [offset, attr] :
+       llvm::enumerate(llvm::cast<StructDefOp>(unwrap(op)).getTemplateExprOpNames())) {
+    dst[offset] = wrap(attr);
+  }
+}
+
+intptr_t llzkStruct_StructDefOpGetNumTemplateExprOpNames(MlirOperation op) {
+  return llzk::checkedCast<intptr_t>(
+      llvm::cast<StructDefOp>(unwrap(op)).getTemplateExprOpNames().size()
+  );
 }
 
 //===----------------------------------------------------------------------===//
@@ -160,7 +182,7 @@ LLZK_DEFINE_SUFFIX_OP_BUILD_METHOD(
 }
 
 LLZK_DEFINE_SUFFIX_OP_BUILD_METHOD(
-    Struct, MemberReadOp, WithConstParamDistance, MlirType memberType, MlirValue component,
+    Struct, MemberReadOp, WithTemplateSymbolDistance, MlirType memberType, MlirValue component,
     MlirIdentifier memberName, MlirStringRef symbol
 ) {
   return wrap(
