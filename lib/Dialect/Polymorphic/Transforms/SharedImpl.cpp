@@ -19,6 +19,7 @@
 #include "llzk/Dialect/Include/IR/Dialect.h"
 #include "llzk/Dialect/LLZK/IR/Dialect.h"
 #include "llzk/Dialect/Polymorphic/IR/Dialect.h"
+#include "llzk/Dialect/RAM/IR/Dialect.h"
 #include "llzk/Dialect/String/IR/Dialect.h"
 #include "llzk/Dialect/Struct/IR/Dialect.h"
 
@@ -29,7 +30,8 @@ mlir::ConversionTarget llzk::polymorphic::detail::newBaseTarget(mlir::MLIRContex
       llzk::cast::CastDialect, llzk::component::StructDialect, llzk::constrain::ConstrainDialect,
       llzk::felt::FeltDialect, llzk::function::FunctionDialect, llzk::global::GlobalDialect,
       llzk::include::IncludeDialect, llzk::polymorphic::PolymorphicDialect,
-      llzk::string::StringDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect>();
+      llzk::ram::RAMDialect, llzk::string::StringDialect, mlir::arith::ArithDialect,
+      mlir::scf::SCFDialect>();
   target.addLegalOp<mlir::ModuleOp>();
   return target;
 }
