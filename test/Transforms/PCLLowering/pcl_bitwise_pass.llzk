@@ -1,0 +1,166 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// Soundness checks: booleanity per bit (exemplar), sum-eq per operand,
+// op-specific per-bit mix, output equality against the recomposition.
+// BUDGET pins the total assertion count (62·bool + 2·sum + 2·range +
+// 1·out = 67 binary; halve for unary).
+
+module attributes {llzk.lang} {
+  struct.def @BitAnd {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@BitAnd> {
+      %self = struct.new : <@BitAnd>
+      function.return %self : !struct.type<@BitAnd>
+    }
+    function.def @constrain(%self: !struct.type<@BitAnd>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.bit_and %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@BitAnd>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @BitAnd(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      %[[ZERO:[0-9a-zA-Z_\.]+]] = pcl.const  0
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// Booleanity: b·(b−1) == 0 for first LHS bit.
+// CHECK-NEXT:      %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[B0M1:[0-9a-zA-Z_\.]+]] = pcl.sub %[[B0]], %[[ONE]]
+// CHECK-NEXT:      %[[B0PR:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B0]], %[[B0M1]]
+// CHECK-NEXT:      %[[B0EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[B0PR]], %[[ZERO]]
+// CHECK-NEXT:      pcl.assert %[[B0EQ]]
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK-NEXT:      pcl.assert
+// AND: out_0 = lhs_0 · rhs_0.
+// CHECK:           pcl.mul %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// Crown-jewel: %[[OUT]] equals recomposed mix.
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @BitAnd(
+// BUDGET-COUNT-67: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @BitOr {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@BitOr> {
+      %self = struct.new : <@BitOr>
+      function.return %self : !struct.type<@BitOr>
+    }
+    function.def @constrain(%self: !struct.type<@BitOr>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.bit_or %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@BitOr>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @BitOr(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK-NEXT:      pcl.assert
+// OR: out_0 = lhs_0 + rhs_0 − lhs_0·rhs_0 (sub directly after mul).
+// CHECK:           %[[SUM0:[0-9a-zA-Z_\.]+]] = pcl.add %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      %[[PROD0:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      pcl.sub %[[SUM0]], %[[PROD0]]
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @BitOr(
+// BUDGET-COUNT-67: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @BitXor {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@BitXor> {
+      %self = struct.new : <@BitXor>
+      function.return %self : !struct.type<@BitXor>
+    }
+    function.def @constrain(%self: !struct.type<@BitXor>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.bit_xor %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@BitXor>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @BitXor(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK-NEXT:      pcl.assert
+// XOR: out_0 = lhs_0 + rhs_0 − 2·(lhs_0·rhs_0) (add prod,prod doubles).
+// CHECK:           %[[SUM0:[0-9a-zA-Z_\.]+]] = pcl.add %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      %[[PROD0:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      %[[TWOPROD0:[0-9a-zA-Z_\.]+]] = pcl.add %[[PROD0]], %[[PROD0]]
+// CHECK-NEXT:      pcl.sub %[[SUM0]], %[[TWOPROD0]]
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @BitXor(
+// BUDGET-COUNT-67: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @BitNot {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@BitNot> {
+      %self = struct.new : <@BitNot>
+      function.return %self : !struct.type<@BitNot>
+    }
+    function.def @constrain(%self: !struct.type<@BitNot>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.bit_not %a : !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@BitNot>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @BitNot(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// NOT: out_0 = 1 − lhs_0 (fresh const per bit).
+// CHECK:           %[[BIT_ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      pcl.sub %[[BIT_ONE]], %[[B0]]
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @BitNot(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert
