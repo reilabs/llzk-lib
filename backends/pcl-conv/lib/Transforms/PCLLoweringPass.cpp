@@ -134,19 +134,18 @@ lowerConst(OpBuilder &b, mlir::arith::ConstantOp cst, llvm::DenseMap<Value, Valu
   return lowerConstImpl(b, cst.getResult(), cst.getLoc(), value, mapping);
 }
 
-/// Allocates `n` fresh `pcl.var` bit witnesses via `nameGen`, asserts booleanity
-/// for each, and asserts `Σ b_i · 2^i == pclValue`.
+/// Bit-decomposes `pclValue` against `prime`, three constraints:
+///   1. Booleanity: `b_i · (b_i − 1) == 0` for each bit.
+///   2. Weighted sum equality: `Σ b_i · 2^i == pclValue`.
+///   3. Range check: `Σ b_i · 2^i < prime`, via a bitwise comparison against `prime`'s bits.
 /// Returns the bit vector with the low bit at index 0.
-///
-/// Precondition: `n >= 1`.
-[[maybe_unused]] static SmallVector<Value> decomposeBits(
-    OpBuilder &b, Location loc, Value pclValue, unsigned n,
+static SmallVector<Value> decomposeBits(
+    OpBuilder &b, Location loc, Value pclValue, const llvm::APInt &prime,
     llvm::function_ref<std::string()> nameGen
 ) {
-  assert(n >= 1 && "decomposeBits requires at least one bit");
+  unsigned n = prime.getActiveBits();
+  assert(n >= 1 && "decomposeBits requires a prime with at least one bit");
   auto *ctx = b.getContext();
-  // Widen storage by one bit so 2^(n-1) is representable without sign-flipping,
-  // matching the convention used by `setPrime` for the module `pcl.prime` attr.
   unsigned constBits = n + 1;
   auto zeroConst =
       b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0)));
@@ -177,6 +176,29 @@ lowerConst(OpBuilder &b, mlir::arith::ConstantOp cst, llvm::DenseMap<Value, Valu
 
   auto eq = b.create<pcl::CmpEqOp>(loc, acc, pclValue);
   b.create<pcl::AssertOp>(loc, eq.getRes());
+
+  // Range check: Σ b_i · 2^i < prime. Two
+  // accumulators, each in {0, 1}:
+  //   strictLess — the prefix seen so far is strictly less than p's prefix.
+  //   stillEqual — the prefix seen so far equals p's prefix.
+  // strictLess + stillEqual == 0 means the prefix already exceeded p; the
+  // final `strictLess == 1` assert catches that case.
+  Value strictLess = zeroConst.getRes();
+  Value stillEqual = oneConst.getRes();
+  for (int i = n-1; i >= 0; --i) {
+    Value bit = bits[i];
+    auto complement = b.create<pcl::SubOp>(loc, oneConst.getRes(), bit);
+    if (prime[i]) {
+      auto delta = b.create<pcl::MulOp>(loc, stillEqual, complement.getRes());
+      strictLess = b.create<pcl::AddOp>(loc, strictLess, delta.getRes()).getRes();
+      stillEqual = b.create<pcl::MulOp>(loc, stillEqual, bit).getRes();
+    } else {
+      stillEqual = b.create<pcl::MulOp>(loc, stillEqual, complement.getRes()).getRes();
+    }
+  }
+  auto ltEq = b.create<pcl::CmpEqOp>(loc, strictLess, oneConst.getRes());
+  b.create<pcl::AssertOp>(loc, ltEq.getRes());
+
   return bits;
 }
 
@@ -185,8 +207,7 @@ lowerConst(OpBuilder &b, mlir::arith::ConstantOp cst, llvm::DenseMap<Value, Valu
 /// any range-check or booleanity constraints on the input bits.
 ///
 /// Precondition: `bits` is non-empty.
-[[maybe_unused]] static Value
-recomposeBits(OpBuilder &b, Location loc, ArrayRef<Value> bits) {
+static Value recomposeBits(OpBuilder &b, Location loc, ArrayRef<Value> bits) {
   assert(!bits.empty() && "recomposeBits requires at least one bit");
   auto *ctx = b.getContext();
   unsigned constBits = static_cast<unsigned>(bits.size()) + 1;
@@ -302,6 +323,12 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
 
   /// Lower the constraint ops to PCL ops
   LogicalResult lowerStructToPCLBody(StructDefOp structDef, func::FuncOp dstFunc) {
+    // Pull the field prime off the enclosing module
+    auto primeAttr =
+        dstFunc->getParentOfType<ModuleOp>()->getAttrOfType<pcl::PrimeAttr>("pcl.prime");
+    assert(primeAttr && "pcl.prime attribute must be set before lowering");
+    llvm::APInt prime = primeAttr.getValue().getValue();
+
     // As we build, map llzk values to their pcl ones
     llvm::DenseMap<Value, Value> llzkToPcl;
     OpBuilder b(dstFunc.getBody());
@@ -321,6 +348,49 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         id++;
       } while (member2pclvar.contains(name));
       return name;
+    };
+
+    // Shared scaffolding for bitwise binary felt ops
+    auto lowerBitwiseBinary = 
+    [&](auto op, llvm::function_ref<Value(Location, Value, Value)> mix) -> LogicalResult {
+      auto lhs = lookup(op.getLhs(), llzkToPcl, op);
+      if (failed(lhs)) {
+        return failure();
+      }
+      auto rhs = lookup(op.getRhs(), llzkToPcl, op);
+      if (failed(rhs)) {
+        return failure();
+      }
+      auto loc = op.getLoc();
+      auto lb = decomposeBits(b, loc, *lhs, prime, getNondetVarName);
+      auto rb = decomposeBits(b, loc, *rhs, prime, getNondetVarName);
+      unsigned n = prime.getActiveBits();
+      SmallVector<Value> ob;
+      ob.reserve(n);
+      for (unsigned i = 0; i < n; ++i) {
+        ob.push_back(mix(loc, lb[i], rb[i]));
+      }
+      rememberResult(op.getResult(), recomposeBits(b, loc, ob), llzkToPcl);
+      return success();
+    };
+
+    // Unary counterpart of `lowerBitwiseBinary`.
+    auto lowerBitwiseUnary = 
+    [&](auto op,  llvm::function_ref<Value(Location, Value)> mix) -> LogicalResult {
+      auto operand = lookup(op.getOperand(), llzkToPcl, op);
+      if (failed(operand)) {
+        return failure();
+      }
+      auto loc = op.getLoc();
+      auto ab = decomposeBits(b, loc, *operand, prime, getNondetVarName);
+      unsigned n = prime.getActiveBits();
+      SmallVector<Value> ob;
+      ob.reserve(n);
+      for (unsigned i = 0; i < n; ++i) {
+        ob.push_back(mix(loc, ab[i]));
+      }
+      rememberResult(op.getResult(), recomposeBits(b, loc, ob), llzkToPcl);
+      return success();
     };
 
     auto srcFunc = structDef.getConstrainFuncOp();
@@ -376,6 +446,38 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       })
           .Case<NegFeltOp>([&b, &llzkToPcl, &res](auto n) {
         res = lowerUnaryLike<NegFeltOp, pcl::NegOp>(b, n, llzkToPcl);
+      })
+          .Case<AndFeltOp>([&b, &lowerBitwiseBinary, &res](AndFeltOp op) {
+        // AND: out_i = a_i · b_i
+        res = lowerBitwiseBinary(op, [&b](Location loc, Value av, Value bv) {
+          return b.create<pcl::MulOp>(loc, av, bv).getRes();
+        });
+      })
+          .Case<OrFeltOp>([&b, &lowerBitwiseBinary, &res](OrFeltOp op) {
+        // OR: out_i = a_i + b_i − a_i · b_i
+        res = lowerBitwiseBinary(op, [&b](Location loc, Value av, Value bv) {
+          auto sum = b.create<pcl::AddOp>(loc, av, bv);
+          auto prod = b.create<pcl::MulOp>(loc, av, bv);
+          return b.create<pcl::SubOp>(loc, sum.getRes(), prod.getRes()).getRes();
+        });
+      })
+          .Case<XorFeltOp>([&b, &lowerBitwiseBinary, &res](XorFeltOp op) {
+        // XOR: out_i = a_i + b_i − 2·a_i·b_i
+        res = lowerBitwiseBinary(op, [&b](Location loc, Value av, Value bv) {
+          auto sum = b.create<pcl::AddOp>(loc, av, bv);
+          auto prod = b.create<pcl::MulOp>(loc, av, bv);
+          auto twoProd = b.create<pcl::AddOp>(loc, prod.getRes(), prod.getRes());
+          return b.create<pcl::SubOp>(loc, sum.getRes(), twoProd.getRes()).getRes();
+        });
+      })
+          .Case<NotFeltOp>([&b, &lowerBitwiseUnary, &res](NotFeltOp op) {
+        // NOT: out_i = 1 − a_i (one's-complement of the decomposition).
+        res = lowerBitwiseUnary(op, [&b](Location loc, Value av) {
+          auto oneConst = b.create<pcl::ConstOp>(
+              loc, pcl::FeltAttr::get(b.getContext(), llvm::APInt(2, 1))
+          );
+          return b.create<pcl::SubOp>(loc, oneConst.getRes(), av).getRes();
+        });
       })
           .Case<AndBoolOp>([&b, &llzkToPcl, &res](auto a) {
         res = lowerBinaryLike<AndBoolOp, pcl::AndOp>(b, a, llzkToPcl);
