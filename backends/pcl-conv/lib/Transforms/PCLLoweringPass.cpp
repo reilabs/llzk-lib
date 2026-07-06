@@ -134,6 +134,76 @@ lowerConst(OpBuilder &b, mlir::arith::ConstantOp cst, llvm::DenseMap<Value, Valu
   return lowerConstImpl(b, cst.getResult(), cst.getLoc(), value, mapping);
 }
 
+/// Allocates `n` fresh `pcl.var` bit witnesses via `nameGen`, asserts booleanity
+/// for each, and asserts `Σ b_i · 2^i == pclValue`.
+/// Returns the bit vector with the low bit at index 0.
+///
+/// Precondition: `n >= 1`.
+[[maybe_unused]] static SmallVector<Value> decomposeBits(
+    OpBuilder &b, Location loc, Value pclValue, unsigned n,
+    llvm::function_ref<std::string()> nameGen
+) {
+  assert(n >= 1 && "decomposeBits requires at least one bit");
+  auto *ctx = b.getContext();
+  // Widen storage by one bit so 2^(n-1) is representable without sign-flipping,
+  // matching the convention used by `setPrime` for the module `pcl.prime` attr.
+  unsigned constBits = n + 1;
+  auto zeroConst =
+      b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0)));
+  auto oneConst =
+      b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1)));
+
+  SmallVector<Value> bits;
+  bits.reserve(n);
+  Value acc = zeroConst.getRes();
+  llvm::APInt weight(constBits, 1);
+
+  for (unsigned i = 0; i < n; ++i) {
+    auto bit = b.create<pcl::VarOp>(loc, nameGen(), /*is_output=*/false);
+    bits.push_back(bit.getRes());
+
+    // Booleanity: b · (b − 1) == 0.
+    auto bMinus1 = b.create<pcl::SubOp>(loc, bit.getRes(), oneConst.getRes());
+    auto prod = b.create<pcl::MulOp>(loc, bit.getRes(), bMinus1.getRes());
+    auto isZero = b.create<pcl::CmpEqOp>(loc, prod.getRes(), zeroConst.getRes());
+    b.create<pcl::AssertOp>(loc, isZero.getRes());
+
+    // Weighted sum: acc += b · 2^i.
+    auto w = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, weight));
+    auto term = b.create<pcl::MulOp>(loc, bit.getRes(), w.getRes());
+    acc = b.create<pcl::AddOp>(loc, acc, term.getRes()).getRes();
+    weight <<= 1;
+  }
+
+  auto eq = b.create<pcl::CmpEqOp>(loc, acc, pclValue);
+  b.create<pcl::AssertOp>(loc, eq.getRes());
+  return bits;
+}
+
+/// Combinator inverse of `decomposeBits`: given a bit vector (low bit first),
+/// returns `Σ bits[i] · 2^i`. Emits no assertions. Callers are responsible for
+/// any range-check or booleanity constraints on the input bits.
+///
+/// Precondition: `bits` is non-empty.
+[[maybe_unused]] static Value
+recomposeBits(OpBuilder &b, Location loc, ArrayRef<Value> bits) {
+  assert(!bits.empty() && "recomposeBits requires at least one bit");
+  auto *ctx = b.getContext();
+  unsigned constBits = static_cast<unsigned>(bits.size()) + 1;
+  llvm::APInt weight(constBits, 1);
+
+  Value acc = bits[0];
+  weight <<= 1;
+
+  for (unsigned i = 1, e = bits.size(); i < e; ++i) {
+    auto w = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, weight));
+    auto term = b.create<pcl::MulOp>(loc, bits[i], w.getRes());
+    acc = b.create<pcl::AddOp>(loc, acc, term.getRes()).getRes();
+    weight <<= 1;
+  }
+  return acc;
+}
+
 class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
   using Base = PCLLoweringPassBase<PassImpl>;
   using Base::Base;
