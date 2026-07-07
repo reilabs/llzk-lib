@@ -1,0 +1,122 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// Pins for the power-of-two uintdiv/umod lowering: one dividend
+// decomposition per op (budget 34 = 31·bool + 1·sum + 1·range + 1·out on
+// koalabear), quotient vs remainder slicing distinguished via the top
+// recomposition weight 2^28 = 268435456 (present for ÷4 quotient, absent for
+// mod-4 remainder), and decomposition sharing when one dividend feeds both
+// ops (budget 35, not 68).
+
+module attributes {llzk.lang} {
+  struct.def @UintDiv {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@UintDiv> {
+      %self = struct.new : <@UintDiv>
+      function.return %self : !struct.type<@UintDiv>
+    }
+    function.def @constrain(%self: !struct.type<@UintDiv>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c4 = felt.const 4 : !felt.type<"koalabear">
+      %0 = felt.uintdiv %a, %c4 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@UintDiv>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @UintDiv(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      pcl.const  4
+// Booleanity exemplar for the dividend's first bit.
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[B0M1:[0-9a-zA-Z_\.]+]] = pcl.sub %[[B0]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      %[[B0PR:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B0]], %[[B0M1]]
+// Sum-eq targets the dividend.
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// Past the sum-eq only the recomposition emits weight constants; the
+// quotient's re-weights bit 30 down to slice index 28, so 2^28 appears.
+// CHECK:           pcl.const  268435456
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @UintDiv(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @Umod {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@Umod> {
+      %self = struct.new : <@Umod>
+      function.return %self : !struct.type<@Umod>
+    }
+    function.def @constrain(%self: !struct.type<@Umod>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c4 = felt.const 4 : !felt.type<"koalabear">
+      %0 = felt.umod %a, %c4 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@Umod>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @Umod(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// The remainder recomposition only uses bits [0..2), so past the sum-eq no
+// high weight constant appears before the out equality.
+// CHECK-NOT:       pcl.const  268435456
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @Umod(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @DivModPair {
+    struct.member @quot : !felt.type<"koalabear"> {llzk.pub}
+    struct.member @rem : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@DivModPair> {
+      %self = struct.new : <@DivModPair>
+      function.return %self : !struct.type<@DivModPair>
+    }
+    function.def @constrain(%self: !struct.type<@DivModPair>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c4 = felt.const 4 : !felt.type<"koalabear">
+      %q = felt.uintdiv %a, %c4 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %r = felt.umod %a, %c4 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %0 = struct.readm %self[@quot] : !struct.type<@DivModPair>, !felt.type<"koalabear">
+      %1 = struct.readm %self[@rem] : !struct.type<@DivModPair>, !felt.type<"koalabear">
+      constrain.eq %q, %0 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      constrain.eq %r, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// The shared dividend is decomposed once: a single sum-eq against %[[A]],
+// and a budget of one decomposition plus two out equalities.
+// CHECK-LABEL:   func.func @DivModPair(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> (!pcl.felt, !pcl.felt) {
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// CHECK-NOT:       pcl.eq %{{.*}}, %[[A]]
+// CHECK:           pcl.return
+
+// BUDGET-LABEL:    func.func @DivModPair(
+// BUDGET-COUNT-35: pcl.assert
+// BUDGET-NOT:      pcl.assert

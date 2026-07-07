@@ -78,6 +78,14 @@ static void rememberResult(Value from, Value to, llvm::DenseMap<Value, Value> &m
   (void)m.try_emplace(from, to);
 }
 
+static std::optional<llvm::APInt> getPclConstAPInt(Value v) {
+  if (auto c = llvm::dyn_cast_if_present<pcl::ConstOp>(v.getDefiningOp())) {
+    // Chain: ConstOp -> FeltAttr (or BoolAttr-as-int) -> IntegerAttr -> APInt
+    return c.getValue().getValue().getValue();
+  }
+  return std::nullopt;
+}
+
 // Convert binary LLZK op to corresponding binary PCL op
 template <typename SrcBinOp, typename DstBinOp>
 static LogicalResult
@@ -259,22 +267,14 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     // --- Small helpers --------------------------------------------------------
     auto isBool = [](Value v) { return llvm::isa<pcl::BoolType>(v.getType()); };
 
-    auto getConstAPInt = [](Value v) -> std::optional<llvm::APInt> {
-      if (auto c = llvm::dyn_cast_if_present<pcl::ConstOp>(v.getDefiningOp())) {
-        // Chain: ConstOp -> FeltAttr (or BoolAttr-as-int) -> IntegerAttr -> APInt
-        return c.getValue().getValue().getValue();
-      }
-      return std::nullopt;
-    };
-
-    auto isConstOne = [&](Value v) {
-      if (auto ap = getConstAPInt(v)) {
+    auto isConstOne = [](Value v) {
+      if (auto ap = getPclConstAPInt(v)) {
         return ap->isOne();
       }
       return false;
     };
-    auto isConstZero = [&](Value v) {
-      if (auto ap = getConstAPInt(v)) {
+    auto isConstZero = [](Value v) {
+      if (auto ap = getPclConstAPInt(v)) {
         return ap->isZero();
       }
       return false;
@@ -501,6 +501,52 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       return w.getRes();
     };
 
+    // For a constant divisor c = 2^s, quotient and remainder are slices of
+    // the dividend's checked bit decomposition: bits [s..n) and [0..s).
+    // Dynamic and non-power-of-two divisors are rejected: a sound encoding of
+    // `a == q·b + r` for dynamic `b` needs a multiprecision product argument
+    // to rule out field wraparound (e.g. `b = p−1, a = 0` admits the forged
+    // `q = 1, r = 1`), and nothing currently emitted into `@constrain` needs
+    // it.
+    llvm::DenseMap<Value, SmallVector<Value>> dividendBits;
+    auto lowerDivModPow2 = [&](auto op, bool wantQuotient) -> LogicalResult {
+      auto lhs = lookup(op.getLhs(), llzkToPcl, op);
+      auto rhs = lookup(op.getRhs(), llzkToPcl, op);
+      if (failed(lhs) || failed(rhs)) {
+        return failure();
+      }
+      auto divisor = getPclConstAPInt(*rhs);
+      if (!divisor) {
+        return op.emitError("PCL lowering only supports constant divisors");
+      }
+      if (!divisor->isPowerOf2()) {
+        return op.emitError("PCL lowering only supports power-of-two divisors");
+      }
+      unsigned s = divisor->logBase2();
+      auto loc = op.getLoc();
+      unsigned n = prime.getActiveBits();
+      // The same dividend routinely feeds a uintdiv/umod pair; decompose it
+      // only once.
+      auto [it, inserted] = dividendBits.try_emplace(*lhs);
+      if (inserted) {
+        it->second = decomposeBits(b, loc, *lhs, prime, getNondetVarName);
+      }
+      ArrayRef<Value> bits = it->second;
+      // A canonical felt constant is < p, so s < n; clamp for robustness.
+      unsigned split = std::min(s, n);
+      ArrayRef<Value> slice = wantQuotient ? bits.drop_front(split) : bits.take_front(split);
+      Value result;
+      if (slice.empty()) {
+        result =
+            b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(b.getContext(), llvm::APInt(n + 1, 0)))
+                .getRes();
+      } else {
+        result = recomposeBits(b, loc, slice);
+      }
+      rememberResult(op.getResult(), result, llzkToPcl);
+      return success();
+    };
+
     auto srcFunc = structDef.getConstrainFuncOp();
     auto srcArgs = srcFunc.getArguments().drop_front();
     auto dstArgs = dstFunc.getArguments();
@@ -588,6 +634,12 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       })
           .Case<ShlFeltOp>([&lowerShl, &res](ShlFeltOp op) { res = lowerShl(op); })
           .Case<ShrFeltOp>([&lowerShr, &res](ShrFeltOp op) { res = lowerShr(op); })
+          .Case<UnsignedIntDivFeltOp>([&lowerDivModPow2, &res](UnsignedIntDivFeltOp op) {
+        res = lowerDivModPow2(op, /*wantQuotient=*/true);
+      })
+          .Case<UnsignedModFeltOp>([&lowerDivModPow2, &res](UnsignedModFeltOp op) {
+        res = lowerDivModPow2(op, /*wantQuotient=*/false);
+      })
           .Case<InvFeltOp>([&llzkToPcl, &emitInverse, &res](InvFeltOp op) {
         auto operand = lookup(op.getOperand(), llzkToPcl, op);
         if (failed(operand)) {

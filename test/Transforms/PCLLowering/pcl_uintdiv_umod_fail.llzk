@@ -1,0 +1,80 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s
+
+// Dynamic divisors are rejected: without a multiprecision product argument,
+// `a == q·b + r` over the field admits wraparound forgeries.
+module attributes {llzk.lang} {
+  struct.def @DynDiv {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@DynDiv> {
+      %self = struct.new : <@DynDiv>
+      function.return %self : !struct.type<@DynDiv>
+    }
+    function.def @constrain(%self: !struct.type<@DynDiv>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      // expected-error@+1 {{PCL lowering only supports constant divisors}}
+      %0 = felt.uintdiv %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@DynDiv>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @DynMod {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@DynMod> {
+      %self = struct.new : <@DynMod>
+      function.return %self : !struct.type<@DynMod>
+    }
+    function.def @constrain(%self: !struct.type<@DynMod>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      // expected-error@+1 {{PCL lowering only supports constant divisors}}
+      %0 = felt.umod %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@DynMod>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @NonPow2Div {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@NonPow2Div> {
+      %self = struct.new : <@NonPow2Div>
+      function.return %self : !struct.type<@NonPow2Div>
+    }
+    function.def @constrain(%self: !struct.type<@NonPow2Div>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c3 = felt.const 3 : !felt.type<"koalabear">
+      // expected-error@+1 {{PCL lowering only supports power-of-two divisors}}
+      %0 = felt.uintdiv %a, %c3 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@NonPow2Div>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @NonPow2 {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@NonPow2> {
+      %self = struct.new : <@NonPow2>
+      function.return %self : !struct.type<@NonPow2>
+    }
+    function.def @constrain(%self: !struct.type<@NonPow2>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c3 = felt.const 3 : !felt.type<"koalabear">
+      // expected-error@+1 {{PCL lowering only supports power-of-two divisors}}
+      %0 = felt.umod %a, %c3 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@NonPow2>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
