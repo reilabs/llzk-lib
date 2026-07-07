@@ -487,6 +487,20 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       return success();
     };
 
+    // `v · w == 1` pins `w` to the unique inverse and is unsatisfiable for
+    // `v == 0`, matching the dialect's requirement that divisors be non-zero.
+    auto emitInverse = [&](Location loc, Value v) -> Value {
+      auto *ctx = b.getContext();
+      unsigned constBits = prime.getActiveBits() + 1;
+      auto w = b.create<pcl::VarOp>(loc, getNondetVarName(), /*is_output=*/false);
+      Value oneConst =
+          b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1))).getRes();
+      auto prod = b.create<pcl::MulOp>(loc, v, w.getRes());
+      auto eq = b.create<pcl::CmpEqOp>(loc, prod.getRes(), oneConst);
+      b.create<pcl::AssertOp>(loc, eq.getRes());
+      return w.getRes();
+    };
+
     auto srcFunc = structDef.getConstrainFuncOp();
     auto srcArgs = srcFunc.getArguments().drop_front();
     auto dstArgs = dstFunc.getArguments();
@@ -574,6 +588,29 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       })
           .Case<ShlFeltOp>([&lowerShl, &res](ShlFeltOp op) { res = lowerShl(op); })
           .Case<ShrFeltOp>([&lowerShr, &res](ShrFeltOp op) { res = lowerShr(op); })
+          .Case<InvFeltOp>([&llzkToPcl, &emitInverse, &res](InvFeltOp op) {
+        auto operand = lookup(op.getOperand(), llzkToPcl, op);
+        if (failed(operand)) {
+          res = failure();
+          return;
+        }
+        rememberResult(op.getResult(), emitInverse(op.getLoc(), *operand), llzkToPcl);
+      })
+          .Case<DivFeltOp>([&b, &llzkToPcl, &emitInverse, &res](DivFeltOp op) {
+        // Not the cheaper `b · w == a` hint: that leaves `w` unconstrained
+        // when a == b == 0. Inverting `b` keeps the result determined and
+        // rejects b == 0.
+        auto lhs = lookup(op.getLhs(), llzkToPcl, op);
+        auto rhs = lookup(op.getRhs(), llzkToPcl, op);
+        if (failed(lhs) || failed(rhs)) {
+          res = failure();
+          return;
+        }
+        auto loc = op.getLoc();
+        Value invRhs = emitInverse(loc, *rhs);
+        auto result = b.create<pcl::MulOp>(loc, *lhs, invRhs);
+        rememberResult(op.getResult(), result.getRes(), llzkToPcl);
+      })
           .Case<AndBoolOp>([&b, &llzkToPcl, &res](auto a) {
         res = lowerBinaryLike<AndBoolOp, pcl::AndOp>(b, a, llzkToPcl);
       })

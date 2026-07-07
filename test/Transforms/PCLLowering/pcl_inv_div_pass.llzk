@@ -1,0 +1,81 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// `felt.inv` and `felt.div` lower to a fresh variable `w` pinned by
+// `v · w == 1`; division then multiplies the dividend by `w`. No bit
+// decomposition is involved, so the assertion budget is tiny: 1·inverse +
+// 1·out = 2 for both ops. A zero divisor makes `v · w == 1` unsatisfiable.
+
+module attributes {llzk.lang} {
+  struct.def @Inv {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@Inv> {
+      %self = struct.new : <@Inv>
+      function.return %self : !struct.type<@Inv>
+    }
+    function.def @constrain(%self: !struct.type<@Inv>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.inv %a : !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@Inv>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @Inv(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// Inverse witness: w with a·w == 1.
+// CHECK-NEXT:      %[[W:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[PROD:[0-9a-zA-Z_\.]+]] = pcl.mul %[[A]], %[[W]]
+// CHECK-NEXT:      %[[INV_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[PROD]], %[[ONE]]
+// CHECK-NEXT:      pcl.assert %[[INV_EQ]]
+// The witness itself is the op result; it lands directly in the out equality.
+// CHECK-NEXT:      %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[W]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @Inv(
+// BUDGET-COUNT-2:  pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @Div {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Div> {
+      %self = struct.new : <@Div>
+      function.return %self : !struct.type<@Div>
+    }
+    function.def @constrain(%self: !struct.type<@Div>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint} {
+      %0 = felt.div %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@Div>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @Div(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// Divisor inverse witness: w with b·w == 1 (rejects b == 0).
+// CHECK-NEXT:      %[[W:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[PROD:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B]], %[[W]]
+// CHECK-NEXT:      %[[INV_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[PROD]], %[[ONE]]
+// CHECK-NEXT:      pcl.assert %[[INV_EQ]]
+// Quotient: a · w.
+// CHECK-NEXT:      %[[RES:[0-9a-zA-Z_\.]+]] = pcl.mul %[[A]], %[[W]]
+// CHECK-NEXT:      %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[RES]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @Div(
+// BUDGET-COUNT-2:  pcl.assert
+// BUDGET-NOT:      pcl.assert
