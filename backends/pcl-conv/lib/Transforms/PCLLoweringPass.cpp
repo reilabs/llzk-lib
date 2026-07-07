@@ -147,10 +147,8 @@ static SmallVector<Value> decomposeBits(
   assert(n >= 1 && "decomposeBits requires a prime with at least one bit");
   auto *ctx = b.getContext();
   unsigned constBits = n + 1;
-  auto zeroConst =
-      b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0)));
-  auto oneConst =
-      b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1)));
+  auto zeroConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0)));
+  auto oneConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1)));
 
   SmallVector<Value> bits;
   bits.reserve(n);
@@ -185,7 +183,7 @@ static SmallVector<Value> decomposeBits(
   // final `strictLess == 1` assert catches that case.
   Value strictLess = zeroConst.getRes();
   Value stillEqual = oneConst.getRes();
-  for (int i = n-1; i >= 0; --i) {
+  for (int i = n - 1; i >= 0; --i) {
     Value bit = bits[i];
     auto complement = b.create<pcl::SubOp>(loc, oneConst.getRes(), bit);
     if (prime[i]) {
@@ -351,8 +349,8 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     };
 
     // Shared scaffolding for bitwise binary felt ops
-    auto lowerBitwiseBinary = 
-    [&](auto op, llvm::function_ref<Value(Location, Value, Value)> mix) -> LogicalResult {
+    auto lowerBitwiseBinary =
+        [&](auto op, llvm::function_ref<Value(Location, Value, Value)> mix) -> LogicalResult {
       auto lhs = lookup(op.getLhs(), llzkToPcl, op);
       if (failed(lhs)) {
         return failure();
@@ -375,8 +373,8 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     };
 
     // Unary counterpart of `lowerBitwiseBinary`.
-    auto lowerBitwiseUnary = 
-    [&](auto op,  llvm::function_ref<Value(Location, Value)> mix) -> LogicalResult {
+    auto lowerBitwiseUnary = [&](auto op,
+                                 llvm::function_ref<Value(Location, Value)> mix) -> LogicalResult {
       auto operand = lookup(op.getOperand(), llzkToPcl, op);
       if (failed(operand)) {
         return failure();
@@ -390,6 +388,102 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         ob.push_back(mix(loc, ab[i]));
       }
       rememberResult(op.getResult(), recomposeBits(b, loc, ob), llzkToPcl);
+      return success();
+    };
+
+    // Lowers `felt.shl(a, b) = a · 2^b mod p`.
+    //
+    // Only `b` is bit-decomposed. Let c_i = 2^(2^i) mod p (precomputed at
+    // compile time by repeated squaring). Then
+    //   2^b = ∏_{i=0}^{n-1} (b_i · (c_i − 1) + 1)  (mod p),
+    // and the result is `a · 2^b`. Costs ~2n muls plus one decomposition.
+    auto lowerShl = [&](ShlFeltOp op) -> LogicalResult {
+      auto lhs = lookup(op.getLhs(), llzkToPcl, op);
+      auto rhs = lookup(op.getRhs(), llzkToPcl, op);
+      if (failed(lhs) || failed(rhs)) {
+        return failure();
+      }
+      auto loc = op.getLoc();
+      auto *ctx = b.getContext();
+      unsigned n = prime.getActiveBits();
+      unsigned constBits = n + 1;
+      auto bBits = decomposeBits(b, loc, *rhs, prime, getNondetVarName);
+
+      Value oneConst =
+          b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1))).getRes();
+
+      unsigned wideBits = 2 * n + 4;
+      llvm::APInt primeWide = prime.zext(wideBits);
+      llvm::APInt curPow2 = llvm::APInt(wideBits, 2).urem(primeWide);
+
+      Value pow2b = oneConst;
+      for (unsigned i = 0; i < n; ++i) {
+        llvm::APInt cMinus1 = (curPow2 - llvm::APInt(wideBits, 1)).trunc(constBits);
+        auto cm1Const = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, cMinus1));
+        auto scaled = b.create<pcl::MulOp>(loc, bBits[i], cm1Const.getRes());
+        auto factor = b.create<pcl::AddOp>(loc, scaled.getRes(), oneConst);
+        pow2b = b.create<pcl::MulOp>(loc, pow2b, factor.getRes()).getRes();
+        curPow2 = (curPow2 * curPow2).urem(primeWide);
+      }
+      auto result = b.create<pcl::MulOp>(loc, *lhs, pow2b);
+      rememberResult(op.getResult(), result.getRes(), llzkToPcl);
+      return success();
+    };
+
+    // Lowers `felt.shr(a, b) = floor(a / 2^b)` on the unsigned integer
+    // representative of `a`, treating shifts of `n` or more as producing 0.
+    //
+    // Both operands are decomposed into `n` bits. The low `L = ceil(log2(n))`
+    // bits of `b` drive a barrel shifter over the bits of `a`; any higher bit
+    // of `b` being set forces the result to 0 via a multiplicative gate.
+    auto lowerShr = [&](ShrFeltOp op) -> LogicalResult {
+      auto lhs = lookup(op.getLhs(), llzkToPcl, op);
+      auto rhs = lookup(op.getRhs(), llzkToPcl, op);
+      if (failed(lhs) || failed(rhs)) {
+        return failure();
+      }
+      auto loc = op.getLoc();
+      auto *ctx = b.getContext();
+      unsigned n = prime.getActiveBits();
+      unsigned constBits = n + 1;
+      unsigned L = (n > 1) ? llvm::APInt(32, n - 1).getActiveBits() : 0;
+
+      auto aBits = decomposeBits(b, loc, *lhs, prime, getNondetVarName);
+      auto bBits = decomposeBits(b, loc, *rhs, prime, getNondetVarName);
+
+      Value zeroConst =
+          b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0))).getRes();
+      Value oneConst =
+          b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1))).getRes();
+
+      // Barrel shifter over `L` levels: at level i, conditionally shift right
+      // by 2^i controlled by bBits[i]. Positions past the top become 0.
+      SmallVector<Value> cur(aBits.begin(), aBits.end());
+      for (unsigned i = 0; i < L; ++i) {
+        unsigned shift = 1u << i;
+        Value ctrl = bBits[i];
+        SmallVector<Value> next(n);
+        for (unsigned j = 0; j < n; ++j) {
+          Value neighbor = (j + shift < n) ? cur[j + shift] : zeroConst;
+          auto diff = b.create<pcl::SubOp>(loc, neighbor, cur[j]);
+          auto scaled = b.create<pcl::MulOp>(loc, ctrl, diff.getRes());
+          next[j] = b.create<pcl::AddOp>(loc, cur[j], scaled.getRes()).getRes();
+        }
+        cur = std::move(next);
+      }
+
+      // If any bit of `b` at index >= L is set, the shift exceeds the value's
+      // width, so gate every result bit to 0.
+      Value inRange = oneConst;
+      for (unsigned i = L; i < n; ++i) {
+        auto complement = b.create<pcl::SubOp>(loc, oneConst, bBits[i]);
+        inRange = b.create<pcl::MulOp>(loc, inRange, complement.getRes()).getRes();
+      }
+      for (unsigned j = 0; j < n; ++j) {
+        cur[j] = b.create<pcl::MulOp>(loc, inRange, cur[j]).getRes();
+      }
+
+      rememberResult(op.getResult(), recomposeBits(b, loc, cur), llzkToPcl);
       return success();
     };
 
@@ -473,12 +567,13 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
           .Case<NotFeltOp>([&b, &lowerBitwiseUnary, &res](NotFeltOp op) {
         // NOT: out_i = 1 − a_i (one's-complement of the decomposition).
         res = lowerBitwiseUnary(op, [&b](Location loc, Value av) {
-          auto oneConst = b.create<pcl::ConstOp>(
-              loc, pcl::FeltAttr::get(b.getContext(), llvm::APInt(2, 1))
-          );
+          auto oneConst =
+              b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(b.getContext(), llvm::APInt(2, 1)));
           return b.create<pcl::SubOp>(loc, oneConst.getRes(), av).getRes();
         });
       })
+          .Case<ShlFeltOp>([&lowerShl, &res](ShlFeltOp op) { res = lowerShl(op); })
+          .Case<ShrFeltOp>([&lowerShr, &res](ShrFeltOp op) { res = lowerShr(op); })
           .Case<AndBoolOp>([&b, &llzkToPcl, &res](auto a) {
         res = lowerBinaryLike<AndBoolOp, pcl::AndOp>(b, a, llzkToPcl);
       })

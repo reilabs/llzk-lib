@@ -164,3 +164,102 @@ module attributes {llzk.lang} {
 // BUDGET-LABEL:    func.func @BitNot(
 // BUDGET-COUNT-34: pcl.assert
 // BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @Shl {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Shl> {
+      %self = struct.new : <@Shl>
+      function.return %self : !struct.type<@Shl>
+    }
+    function.def @constrain(%self: !struct.type<@Shl>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.shl %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@Shl>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// Only `b` is decomposed; `a` stays a single felt and is multiplied by
+// the reconstructed `2^b` at the end.
+// CHECK-LABEL:   func.func @Shl(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK:           %[[B0:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// Sum-eq targets the shift amount %[[B]] (not %[[A]]); and no `eq %..., %[[A]]`
+// ever appears before the crown-jewel `eq %..., %[[OUT]]`.
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK-NEXT:      pcl.assert
+// CHECK-NOT:       pcl.eq %{{.*}}, %[[A]]
+// SHL preamble (past the range check): the loop's shared oneConst is emitted
+// first, then `pcl.const (c_0 − 1) = 1` because c_0 = 2. The two identical
+// consts back-to-back are unique to SHL, and pin down which one is CM1_0.
+// CHECK:           %[[ONE_LOCAL:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[CM1_0:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[SCAL0:[0-9a-zA-Z_\.]+]] = pcl.mul %[[B0]], %[[CM1_0]]
+// CHECK-NEXT:      pcl.add %[[SCAL0]], %[[ONE_LOCAL]]
+// Final step: multiply the undecomposed %[[A]] by the reconstructed 2^b.
+// CHECK:           pcl.mul %[[A]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// One decomposition worth of asserts (like BitNot): 31·bool + 1·sum +
+// 1·range + 1·out = 34.
+// BUDGET-LABEL:    func.func @Shl(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+module attributes {llzk.lang} {
+  struct.def @Shr {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Shr> {
+      %self = struct.new : <@Shr>
+      function.return %self : !struct.type<@Shr>
+    }
+    function.def @constrain(%self: !struct.type<@Shr>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %0 = felt.shr %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@Shr>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// Both operands are decomposed; the low bits of `b` drive a barrel
+// shifter over the bits of `a`, and the high bits of `b` gate the
+// result to 0 when the shift exceeds the value width.
+// CHECK-LABEL:   func.func @Shr(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// Sum-eq assertions for both operands land in this order (a first, then b),
+// so both are decomposed. The barrel-shifter preamble follows past the
+// range-check assertions.
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK-NEXT:      pcl.assert
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK-NEXT:      pcl.assert
+// Barrel-shifter preamble: SHR emits its own fresh zero/one consts (no
+// other lowering emits this pair here), followed by the level-0 sub → mul
+// → add triple. CHECK-NEXT chains the triple to enforce contiguity.
+// CHECK:           pcl.const  0
+// CHECK-NEXT:      pcl.const  1
+// CHECK-NEXT:      %[[DIFF0:[0-9a-zA-Z_\.]+]] = pcl.sub
+// CHECK-NEXT:      %[[SCAL0:[0-9a-zA-Z_\.]+]] = pcl.mul %{{[0-9a-zA-Z_\.]+}}, %[[DIFF0]]
+// CHECK-NEXT:      pcl.add %{{[0-9a-zA-Z_\.]+}}, %[[SCAL0]]
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// Two decompositions (like the binary bitwise ops): 62·bool + 2·sum +
+// 2·range + 1·out = 67.
+// BUDGET-LABEL:    func.func @Shr(
+// BUDGET-COUNT-67: pcl.assert
+// BUDGET-NOT:      pcl.assert
