@@ -18,6 +18,7 @@
 #include "llzk/Dialect/LLZK/IR/Dialect.h"
 #include "llzk/Dialect/POD/IR/Dialect.h"
 #include "llzk/Dialect/Polymorphic/IR/Dialect.h"
+#include "llzk/Dialect/RAM/IR/Dialect.h"
 #include "llzk/Dialect/String/IR/Dialect.h"
 #include "llzk/Dialect/Struct/IR/Dialect.h"
 #include "llzk/Transforms/LLZKTransformationPasses.h"
@@ -111,6 +112,7 @@ void registerInliningExtensions(DialectRegistry &registry) {
   registry.addExtension(FullyLegalForInlining<include::IncludeDialect>::registrationHook);
   registry.addExtension(FullyLegalForInlining<llzk::LLZKDialect>::registrationHook);
   registry.addExtension(FullyLegalForInlining<pod::PODDialect>::registrationHook);
+  registry.addExtension(FullyLegalForInlining<ram::RAMDialect>::registrationHook);
 }
 
 } // namespace llzk
