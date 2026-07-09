@@ -1,0 +1,182 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// Width bucketing: an asserted range guard `x < 2^k` (the pattern noir_llzk
+// emits before bitwise blackboxes) lets later decompositions of `x` use `k`
+// bits instead of the full field width, and decompositions narrower than the
+// field width skip the range check against the prime. Decomposed bits are
+// cached and shared across ops on the same value.
+
+// Both operands guarded to 8 bits, so AND costs two 8-bit decompositions
+// (8 bool + 1 sum each) plus 2 guard asserts and 1 output equality: 21.
+module attributes {llzk.lang} {
+  struct.def @GuardedAnd {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@GuardedAnd> {
+      %self = struct.new : <@GuardedAnd>
+      function.return %self : !struct.type<@GuardedAnd>
+    }
+    function.def @constrain(%self: !struct.type<@GuardedAnd>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %bound = felt.const 256 : <"koalabear">
+      %one = felt.const 1 : <"koalabear">
+      %ga = bool.cmp lt(%a, %bound) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gaf = cast.tofelt %ga : i1, !felt.type<"koalabear">
+      constrain.eq %gaf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gb = bool.cmp lt(%b, %bound) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gbf = cast.tofelt %gb : i1, !felt.type<"koalabear">
+      constrain.eq %gbf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %0 = felt.bit_and %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@GuardedAnd>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @GuardedAnd(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK:           %[[GA:[0-9a-zA-Z_\.]+]] = pcl.lt %[[A]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK:           pcl.assert %[[GA]]
+// CHECK:           %[[GB:[0-9a-zA-Z_\.]+]] = pcl.lt %[[B]], %{{[0-9a-zA-Z_\.]+}}
+// CHECK:           pcl.assert %[[GB]]
+// CHECK:           pcl.eq %{{.*}}, %[[A]]
+// CHECK:           pcl.eq %{{.*}}, %[[B]]
+// CHECK:           %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %{{.*}}, %{{[0-9a-zA-Z_\.]+}}
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return
+
+// BUDGET-LABEL:    func.func @GuardedAnd(
+// BUDGET-COUNT-21: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// AND with a constant mask: the mask contributes a literal bit vector (no
+// assertions) and truncates the result to its 8 bits; the unguarded operand
+// still needs a full-width decomposition (31 bool + 1 sum + 1 range for
+// koalabear) plus 1 output equality: 34.
+module attributes {llzk.lang} {
+  struct.def @MaskAnd {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@MaskAnd> {
+      %self = struct.new : <@MaskAnd>
+      function.return %self : !struct.type<@MaskAnd>
+    }
+    function.def @constrain(%self: !struct.type<@MaskAnd>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %mask = felt.const 255 : <"koalabear">
+      %0 = felt.bit_and %a, %mask : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@MaskAnd>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// BUDGET-LABEL:    func.func @MaskAnd(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// Constant shift amount folds shl to a single multiplication by 2^s mod p:
+// no decomposition at all, only the output equality remains.
+module attributes {llzk.lang} {
+  struct.def @ConstShl {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@ConstShl> {
+      %self = struct.new : <@ConstShl>
+      function.return %self : !struct.type<@ConstShl>
+    }
+    function.def @constrain(%self: !struct.type<@ConstShl>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %s = felt.const 3 : <"koalabear">
+      %0 = felt.shl %a, %s : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@ConstShl>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @ConstShl(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      pcl.const{{ +}}3
+// CHECK-NEXT:      %[[P2:[0-9a-zA-Z_\.]+]] = pcl.const{{ +}}8
+// CHECK-NEXT:      %[[RES:[0-9a-zA-Z_\.]+]] = pcl.mul %[[A]], %[[P2]]
+// CHECK-NEXT:      %[[OUT_EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[RES]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OUT_EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:   func.func @ConstShl(
+// BUDGET-COUNT-1: pcl.assert
+// BUDGET-NOT:     pcl.assert
+
+// -----
+
+// Constant shift amount reduces shr to a slice of the (guarded, 8-bit)
+// decomposition: 8 bool + 1 sum + 1 guard + 1 output equality = 11.
+module attributes {llzk.lang} {
+  struct.def @ConstShr {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@ConstShr> {
+      %self = struct.new : <@ConstShr>
+      function.return %self : !struct.type<@ConstShr>
+    }
+    function.def @constrain(%self: !struct.type<@ConstShr>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %bound = felt.const 256 : <"koalabear">
+      %one = felt.const 1 : <"koalabear">
+      %g = bool.cmp lt(%a, %bound) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gf = cast.tofelt %g : i1, !felt.type<"koalabear">
+      constrain.eq %gf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %s = felt.const 3 : <"koalabear">
+      %0 = felt.shr %a, %s : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@out] : !struct.type<@ConstShr>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// BUDGET-LABEL:    func.func @ConstShr(
+// BUDGET-COUNT-11: pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// The decomposition cache shares bits across ops on the same values: AND and
+// XOR of the same guarded pair decompose each operand once, not twice.
+// 2 guards + 2·(8 bool + 1 sum) + 2 output equalities = 22.
+module attributes {llzk.lang} {
+  struct.def @SharedBits {
+    struct.member @outAnd : !felt.type<"koalabear"> {llzk.pub}
+    struct.member @outXor : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@SharedBits> {
+      %self = struct.new : <@SharedBits>
+      function.return %self : !struct.type<@SharedBits>
+    }
+    function.def @constrain(%self: !struct.type<@SharedBits>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %bound = felt.const 256 : <"koalabear">
+      %one = felt.const 1 : <"koalabear">
+      %ga = bool.cmp lt(%a, %bound) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gaf = cast.tofelt %ga : i1, !felt.type<"koalabear">
+      constrain.eq %gaf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gb = bool.cmp lt(%b, %bound) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %gbf = cast.tofelt %gb : i1, !felt.type<"koalabear">
+      constrain.eq %gbf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %0 = felt.bit_and %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %1 = struct.readm %self[@outAnd] : !struct.type<@SharedBits>, !felt.type<"koalabear">
+      constrain.eq %0, %1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %2 = felt.bit_xor %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %3 = struct.readm %self[@outXor] : !struct.type<@SharedBits>, !felt.type<"koalabear">
+      constrain.eq %2, %3 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// BUDGET-LABEL:    func.func @SharedBits(
+// BUDGET-COUNT-22: pcl.assert
+// BUDGET-NOT:      pcl.assert
