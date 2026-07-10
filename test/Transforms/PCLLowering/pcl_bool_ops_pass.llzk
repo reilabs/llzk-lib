@@ -1,0 +1,159 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// `bool.cmp ne` lowers to eq + not, and the *negated* value must be the one
+// the result maps to: asserting the ne result must emit `assert(not(eq))`,
+// never `assert(eq)`.
+module attributes {llzk.lang} {
+  struct.def @Ne {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Ne> {
+      %self = struct.new : <@Ne>
+      function.return %self : !struct.type<@Ne>
+    }
+    function.def @constrain(%self: !struct.type<@Ne>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint} {
+      %one = felt.const 1 : <"koalabear">
+      %ne = bool.cmp ne(%a, %b) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %nef = cast.tofelt %ne : i1, !felt.type<"koalabear">
+      constrain.eq %nef, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %r = struct.readm %self[@out] : !struct.type<@Ne>, !felt.type<"koalabear">
+      constrain.eq %a, %r : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @Ne(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[A]], %[[B]]
+// CHECK-NEXT:      %[[NOT:[0-9a-zA-Z_\.]+]] = pcl.not %[[EQ]]
+// The asserted value is the negation, not the raw equality.
+// CHECK-NEXT:      pcl.assert %[[NOT]]
+// CHECK-NEXT:      %[[OEQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[A]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OEQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @Ne(
+// BUDGET-COUNT-2:  pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// `bool.xor` lowers to iff + not; asserting the xor result must emit
+// `assert(not(iff))` (a != b), never `assert(iff)` (a == b).
+module attributes {llzk.lang} {
+  struct.def @Xor {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Xor> {
+      %self = struct.new : <@Xor>
+      function.return %self : !struct.type<@Xor>
+    }
+    function.def @constrain(%self: !struct.type<@Xor>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %one = felt.const 1 : <"koalabear">
+      %c1 = bool.cmp lt(%a, %b) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %c2 = bool.cmp lt(%b, %a) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %x = bool.xor %c1, %c2
+      %xf = cast.tofelt %x : i1, !felt.type<"koalabear">
+      constrain.eq %xf, %one : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %r = struct.readm %self[@out] : !struct.type<@Xor>, !felt.type<"koalabear">
+      constrain.eq %a, %r : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @Xor(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[C1:[0-9a-zA-Z_\.]+]] = pcl.lt %[[A]], %[[B]]
+// CHECK-NEXT:      %[[C2:[0-9a-zA-Z_\.]+]] = pcl.lt %[[B]], %[[A]]
+// CHECK-NEXT:      %[[IFF:[0-9a-zA-Z_\.]+]] = pcl.iff %[[C1]], %[[C2]]
+// CHECK-NEXT:      %[[NOT:[0-9a-zA-Z_\.]+]] = pcl.not %[[IFF]]
+// The asserted value is the negation of the iff (true xor), not the iff.
+// CHECK-NEXT:      pcl.assert %[[NOT]]
+// CHECK-NEXT:      %[[OEQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[A]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OEQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @Xor(
+// BUDGET-COUNT-2:  pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// Felt ops on a bool that was cast with `cast.tofelt` (the Noir
+// bool-as-field pattern): PCL has no bool→felt cast, so the bool is
+// materialized once as a witness `w` pinned by `w·(w−1) == 0` and
+// `b ⟺ (w == 1)`; `w` doubles as the value's 1-bit decomposition. The
+// witness is cached: `felt.inv` on the same cast reuses `w` instead of
+// materializing a second one.
+module attributes {llzk.lang} {
+  struct.def @CastFelt {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    struct.member @out2 : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@CastFelt> {
+      %self = struct.new : <@CastFelt>
+      function.return %self : !struct.type<@CastFelt>
+    }
+    function.def @constrain(%self: !struct.type<@CastFelt>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %c = bool.cmp lt(%a, %b) : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %cf = cast.tofelt %c : i1, !felt.type<"koalabear">
+      %mask = felt.const 1 : <"koalabear">
+      %and = felt.bit_and %cf, %mask : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %inv = felt.inv %cf : !felt.type<"koalabear">
+      %o1 = struct.readm %self[@out] : !struct.type<@CastFelt>, !felt.type<"koalabear">
+      %o2 = struct.readm %self[@out2] : !struct.type<@CastFelt>, !felt.type<"koalabear">
+      constrain.eq %and, %o1 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      constrain.eq %inv, %o2 : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @CastFelt(
+// CHECK-SAME:        %[[A:[0-9a-zA-Z_\.]+]]: !pcl.felt,
+// CHECK-SAME:        %[[B:[0-9a-zA-Z_\.]+]]: !pcl.felt) -> (!pcl.felt, !pcl.felt) {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      %[[OUT2:[0-9a-zA-Z_\.]+]] = pcl.var "out2" true
+// CHECK-NEXT:      %[[LT:[0-9a-zA-Z_\.]+]] = pcl.lt %[[A]], %[[B]]
+// CHECK-NEXT:      %[[MASK:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// Bool→felt witness: booleanity w·(w−1) == 0 ...
+// CHECK-NEXT:      %[[W:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[ZERO:[0-9a-zA-Z_\.]+]] = pcl.const  0
+// CHECK-NEXT:      %[[ONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[WM1:[0-9a-zA-Z_\.]+]] = pcl.sub %[[W]], %[[ONE]]
+// CHECK-NEXT:      %[[WPROD:[0-9a-zA-Z_\.]+]] = pcl.mul %[[W]], %[[WM1]]
+// CHECK-NEXT:      %[[BOOLEQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[WPROD]], %[[ZERO]]
+// CHECK-NEXT:      pcl.assert %[[BOOLEQ]]
+// ... and the link b ⟺ (w == 1).
+// CHECK-NEXT:      %[[EQONE:[0-9a-zA-Z_\.]+]] = pcl.eq %[[W]], %[[ONE]]
+// CHECK-NEXT:      %[[LINK:[0-9a-zA-Z_\.]+]] = pcl.iff %[[LT]], %[[EQONE]]
+// CHECK-NEXT:      pcl.assert %[[LINK]]
+// AND against the 1-bit constant: out_0 = w · 1.
+// CHECK-NEXT:      %[[BIT1:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[AND:[0-9a-zA-Z_\.]+]] = pcl.mul %[[W]], %[[BIT1]]
+// Inverse of the same cast reuses the cached witness `w` (no second
+// booleanity/link block): v with w·v == 1.
+// CHECK-NEXT:      %[[V:[0-9a-zA-Z_\.]+]] = pcl.var "_nondet_internal_var__
+// CHECK-NEXT:      %[[IONE:[0-9a-zA-Z_\.]+]] = pcl.const  1
+// CHECK-NEXT:      %[[IPROD:[0-9a-zA-Z_\.]+]] = pcl.mul %[[W]], %[[V]]
+// CHECK-NEXT:      %[[IEQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[IPROD]], %[[IONE]]
+// CHECK-NEXT:      pcl.assert %[[IEQ]]
+// CHECK-NEXT:      %[[OEQ1:[0-9a-zA-Z_\.]+]] = pcl.eq %[[AND]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[OEQ1]]
+// CHECK-NEXT:      %[[OEQ2:[0-9a-zA-Z_\.]+]] = pcl.eq %[[V]], %[[OUT2]]
+// CHECK-NEXT:      pcl.assert %[[OEQ2]]
+// CHECK-NEXT:      pcl.return %[[OUT]], %[[OUT2]]
+
+// 2 witness asserts + 1 inverse + 2 output equalities = 5. A broken witness
+// cache would show up as 7 (a second booleanity/link block).
+// BUDGET-LABEL:    func.func @CastFelt(
+// BUDGET-COUNT-5:  pcl.assert
+// BUDGET-NOT:      pcl.assert

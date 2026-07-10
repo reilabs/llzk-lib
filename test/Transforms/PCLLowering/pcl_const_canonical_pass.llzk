@@ -1,0 +1,70 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -split-input-file -llzk-to-pcl -verify-diagnostics %s > %t
+// RUN: FileCheck --enable-var-scope %s < %t
+// RUN: FileCheck --enable-var-scope --check-prefix=BUDGET %s < %t
+
+// `felt.const` does not enforce a canonical (< p) value, but every constant
+// fast path in the lowering (literal bit vectors, power-of-two divisor
+// checks, shift exponents) reads the emitted APInt as the field element.
+// The lowering must reduce mod p. koalabear p = 2130706433.
+
+// p + 5 must materialize as 5.
+module attributes {llzk.lang} {
+  struct.def @NonCanonConst {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute() -> !struct.type<@NonCanonConst> {
+      %self = struct.new : <@NonCanonConst>
+      function.return %self : !struct.type<@NonCanonConst>
+    }
+    function.def @constrain(%self: !struct.type<@NonCanonConst>) attributes {function.allow_constraint} {
+      %c = felt.const 2130706438 : <"koalabear">
+      %r = struct.readm %self[@out] : !struct.type<@NonCanonConst>, !felt.type<"koalabear">
+      constrain.eq %c, %r : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// CHECK-LABEL:   func.func @NonCanonConst() -> !pcl.felt {
+// CHECK-NEXT:      %[[OUT:[0-9a-zA-Z_\.]+]] = pcl.var "out" true
+// CHECK-NEXT:      %[[C:[0-9a-zA-Z_\.]+]] = pcl.const  5
+// CHECK-NEXT:      %[[EQ:[0-9a-zA-Z_\.]+]] = pcl.eq %[[C]], %[[OUT]]
+// CHECK-NEXT:      pcl.assert %[[EQ]]
+// CHECK-NEXT:      pcl.return %[[OUT]]
+
+// BUDGET-LABEL:    func.func @NonCanonConst(
+// BUDGET-COUNT-1:  pcl.assert
+// BUDGET-NOT:      pcl.assert
+
+// -----
+
+// A divisor of p + 4 IS a division by 4 (a power of two): the power-of-two
+// check must see the canonical value, so this lowers to a bit slice instead
+// of being rejected — and a raw power of two above p must NOT be accepted.
+module attributes {llzk.lang} {
+  struct.def @NonCanonPow2Div {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">) -> !struct.type<@NonCanonPow2Div> {
+      %self = struct.new : <@NonCanonPow2Div>
+      function.return %self : !struct.type<@NonCanonPow2Div>
+    }
+    function.def @constrain(%self: !struct.type<@NonCanonPow2Div>, %a: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      %d = felt.const 2130706437 : <"koalabear">
+      %q = felt.uintdiv %a, %d : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %r = struct.readm %self[@out] : !struct.type<@NonCanonPow2Div>, !felt.type<"koalabear">
+      constrain.eq %q, %r : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
+
+// The divisor constant is materialized canonically.
+// CHECK-LABEL:   func.func @NonCanonPow2Div(
+// CHECK:           pcl.const  4
+// CHECK-NOT:       pcl.const  2130706437
+
+// Full-width decomposition of the unguarded dividend: 31 booleanity + 1 sum
+// + 1 range check = 33, plus the output equality = 34.
+// BUDGET-LABEL:    func.func @NonCanonPow2Div(
+// BUDGET-COUNT-34: pcl.assert
+// BUDGET-NOT:      pcl.assert

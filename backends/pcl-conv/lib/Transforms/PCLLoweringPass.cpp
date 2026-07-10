@@ -121,25 +121,40 @@ lowerUnaryLike(OpBuilder &b, SrcBinOp src, llvm::DenseMap<Value, Value> &mapping
 }
 
 static LogicalResult lowerConstImpl(
-    OpBuilder &b, Value result, Location location, llvm::APInt &value,
-    llvm::DenseMap<Value, Value> &mapping
+    OpBuilder &b, Value result, Location location, const llvm::APInt &value,
+    const llvm::APInt &prime, llvm::DenseMap<Value, Value> &mapping
 ) {
-  auto attr = pcl::FeltAttr::get(b.getContext(), value);
+  // FeltConstAttr does not enforce a canonical (< p) value, but the constant
+  // fast paths downstream (literal bit vectors, power-of-two divisor checks,
+  // modExp exponents) all read this op's APInt as the field element. Reduce
+  // mod p so they never see an unreduced representative.
+  llvm::APInt canonical = value;
+  unsigned w = std::max(value.getBitWidth(), prime.getBitWidth());
+  llvm::APInt vExt = value.zextOrTrunc(w);
+  llvm::APInt pExt = prime.zextOrTrunc(w);
+  if (vExt.uge(pExt)) {
+    canonical = vExt.urem(pExt);
+  }
+  auto attr = pcl::FeltAttr::get(b.getContext(), canonical);
   auto dst = b.create<pcl::ConstOp>(location, attr);
   rememberResult(result, dst.getRes(), mapping);
   return success();
 }
 
-static LogicalResult
-lowerConst(OpBuilder &b, FeltConstantOp cst, llvm::DenseMap<Value, Value> &mapping) {
+static LogicalResult lowerConst(
+    OpBuilder &b, FeltConstantOp cst, const llvm::APInt &prime,
+    llvm::DenseMap<Value, Value> &mapping
+) {
   auto value = cst.getValue().getValue();
-  return lowerConstImpl(b, cst.getResult(), cst->getLoc(), value, mapping);
+  return lowerConstImpl(b, cst.getResult(), cst->getLoc(), value, prime, mapping);
 }
 
-static LogicalResult
-lowerConst(OpBuilder &b, mlir::arith::ConstantOp cst, llvm::DenseMap<Value, Value> &mapping) {
+static LogicalResult lowerConst(
+    OpBuilder &b, mlir::arith::ConstantOp cst, const llvm::APInt &prime,
+    llvm::DenseMap<Value, Value> &mapping
+) {
   auto value = mlir::cast<mlir::IntegerAttr>(cst.getValue()).getValue();
-  return lowerConstImpl(b, cst.getResult(), cst.getLoc(), value, mapping);
+  return lowerConstImpl(b, cst.getResult(), cst.getLoc(), value, prime, mapping);
 }
 
 /// Bit-decomposes `pclValue` into `width` bits, three constraints:
@@ -342,9 +357,10 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     llvm::SmallVector<Value> outVars;
 
     // Create a new variable name for an `llzk.nondet` op with a paranoid check
-    // that the generated name doesn't collide with any member names.
-    auto getNondetVarName = [&member2pclvar]() {
-      static unsigned id = 0;
+    // that the generated name doesn't collide with any member names. The
+    // counter is per-struct (PCL vars are function-scoped) so output does not
+    // depend on what the process lowered earlier.
+    auto getNondetVarName = [&member2pclvar, id = 0u]() mutable {
       std::string name;
       llvm::raw_string_ostream os(name);
       do {
@@ -375,6 +391,32 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         zero = feltConst(loc, 0);
       }
       return zero;
+    };
+
+    // `cast.tofelt` forwards its operand's PCL value, so a felt LLZK value
+    // can map to a `!pcl.bool` (e.g. a cmp result). PCL has no bool→felt
+    // cast; materialize the {0,1} felt value as a witness `w` pinned by
+    // `w·(w−1) == 0` and `b ⟺ (w == 1)`. Cached per bool value.
+    llvm::DenseMap<Value, Value> boolFelt;
+    auto asFelt = [&](Location loc, Value pclVal) -> Value {
+      if (!llvm::isa<pcl::BoolType>(pclVal.getType())) {
+        return pclVal;
+      }
+      auto [it, inserted] = boolFelt.try_emplace(pclVal);
+      if (inserted) {
+        Value w = b.create<pcl::VarOp>(loc, getNondetVarName(), /*is_output=*/false).getRes();
+        Value zero = feltConst(loc, 0);
+        Value one = feltConst(loc, 1);
+        auto wMinus1 = b.create<pcl::SubOp>(loc, w, one);
+        auto prod = b.create<pcl::MulOp>(loc, w, wMinus1.getRes());
+        auto isZero = b.create<pcl::CmpEqOp>(loc, prod.getRes(), zero);
+        b.create<pcl::AssertOp>(loc, isZero.getRes());
+        auto eqOne = b.create<pcl::CmpEqOp>(loc, w, one);
+        auto link = b.create<pcl::IffOp>(loc, pclVal, eqOne.getRes());
+        b.create<pcl::AssertOp>(loc, link.getRes());
+        it->second = w;
+      }
+      return it->second;
     };
 
     // Proven upper bounds (in bits) on values, from constants, range-guard
@@ -425,7 +467,11 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       auto [it, inserted] = bitsCache.try_emplace(pclVal);
       if (inserted) {
         SmallVector<Value> &bits = bitsStorage.emplace_back();
-        if (auto c = getPclConstAPInt(pclVal)) {
+        if (llvm::isa<pcl::BoolType>(pclVal.getType())) {
+          // A bool's felt value is 0 or 1; its witness is already a checked
+          // 1-bit decomposition.
+          bits.push_back(asFelt(loc, pclVal));
+        } else if (auto c = getPclConstAPInt(pclVal)) {
           for (unsigned i = 0, w = constWidth(*c); i < w; ++i) {
             bits.push_back(feltConst(loc, (*c)[i] ? 1 : 0));
           }
@@ -590,7 +636,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
             modExp(llvm::DynamicAPInt(2), toDynamicAPInt(*shift), toDynamicAPInt(prime)), constBits
         );
         auto pow2sConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, pow2s));
-        Value result = b.create<pcl::MulOp>(loc, *lhs, pow2sConst.getRes()).getRes();
+        Value result = b.create<pcl::MulOp>(loc, asFelt(loc, *lhs), pow2sConst.getRes()).getRes();
         rememberResult(op.getResult(), result, llzkToPcl);
         unsigned s = shift->getLimitedValue(fullWidth);
         setBound(op.getResult(), boundOf(op.getLhs()) + s);
@@ -624,7 +670,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         pow2b = b.create<pcl::MulOp>(loc, pow2b, factor.getRes()).getRes();
         curPow2 = (curPow2 * curPow2).urem(primeWide);
       }
-      auto result = b.create<pcl::MulOp>(loc, *lhs, pow2b);
+      auto result = b.create<pcl::MulOp>(loc, asFelt(loc, *lhs), pow2b);
       rememberResult(op.getResult(), result.getRes(), llzkToPcl);
       return success();
     };
@@ -696,6 +742,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     // `v · w == 1` pins `w` to the unique inverse and is unsatisfiable for
     // `v == 0`, matching the dialect's requirement that divisors be non-zero.
     auto emitInverse = [&](Location loc, Value v) -> Value {
+      v = asFelt(loc, v);
       auto w = b.create<pcl::VarOp>(loc, getNondetVarName(), /*is_output=*/false);
       Value oneConst = feltConst(loc, 1);
       auto prod = b.create<pcl::MulOp>(loc, v, w.getRes());
@@ -772,11 +819,11 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     for (Operation &op : srcEntry) {
       LogicalResult res = success();
       llvm::TypeSwitch<Operation *, void>(&op)
-          .Case<FeltConstantOp>([&b, &llzkToPcl, &res](auto c) {
-        res = lowerConst(b, c, llzkToPcl);
+          .Case<FeltConstantOp>([&b, &llzkToPcl, &prime, &res](auto c) {
+        res = lowerConst(b, c, prime, llzkToPcl);
       })
-          .Case<mlir::arith::ConstantOp>([&b, &llzkToPcl, &res](auto c) {
-        res = lowerConst(b, c, llzkToPcl);
+          .Case<mlir::arith::ConstantOp>([&b, &llzkToPcl, &prime, &res](auto c) {
+        res = lowerConst(b, c, prime, llzkToPcl);
       })
           .Case<NonDetOp>([&b, &getNondetVarName, &llzkToPcl](auto n) {
         auto varName = getNondetVarName();
@@ -853,7 +900,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         }
         rememberResult(op.getResult(), emitInverse(op.getLoc(), *operand), llzkToPcl);
       })
-          .Case<DivFeltOp>([&b, &llzkToPcl, &emitInverse, &res](DivFeltOp op) {
+          .Case<DivFeltOp>([&b, &llzkToPcl, &emitInverse, &asFelt, &res](DivFeltOp op) {
         // Not the cheaper `b · w == a` hint: that leaves `w` unconstrained
         // when a == b == 0. Inverting `b` keeps the result determined and
         // rejects b == 0.
@@ -865,7 +912,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         }
         auto loc = op.getLoc();
         Value invRhs = emitInverse(loc, *rhs);
-        auto result = b.create<pcl::MulOp>(loc, *lhs, invRhs);
+        auto result = b.create<pcl::MulOp>(loc, asFelt(loc, *lhs), invRhs);
         rememberResult(op.getResult(), result.getRes(), llzkToPcl);
       })
           .Case<AndBoolOp>([&b, &llzkToPcl, &res](auto a) {
@@ -878,20 +925,18 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         res = lowerUnaryLike<NotBoolOp, pcl::NotOp>(b, n, llzkToPcl);
       })
           .Case<XorBoolOp>([&b, &llzkToPcl, &res](auto x) {
-        // Translate xor as an iff followed by a boolean not
-        res = lowerBinaryLike<XorBoolOp, pcl::IffOp>(b, x, llzkToPcl);
-        if (failed(res)) {
-          return;
-        }
-        // Get the result from the `pcl::IffOp` to pass into `Not`
-        auto iffRes = lookup(x.getResult(), llzkToPcl, x);
-        if (failed(iffRes)) {
+        // xor = ¬(a ⟺ b). Build the whole chain before mapping the result:
+        // rememberResult never overwrites, so mapping the iff first would
+        // permanently associate the result with the un-negated value.
+        auto lhs = lookup(x.getLhs(), llzkToPcl, x);
+        auto rhs = lookup(x.getRhs(), llzkToPcl, x);
+        if (failed(lhs) || failed(rhs)) {
           res = failure();
           return;
         }
         auto loc = x.getLoc();
-        auto not_op = b.create<pcl::NotOp>(loc, *iffRes);
-        // Associate the result of the llzk-op with the result of the pcl-not
+        auto iff = b.create<pcl::IffOp>(loc, *lhs, *rhs);
+        auto not_op = b.create<pcl::NotOp>(loc, iff.getRes());
         rememberResult(x.getResult(), not_op.getResult(), llzkToPcl);
       })
           .Case<IntToFeltOp>([&llzkToPcl, &res](auto m) {
@@ -909,21 +954,18 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
           res = lowerBinaryLike<CmpOp, pcl::CmpEqOp>(b, cmp, llzkToPcl);
           break;
         case FeltCmpPredicate::NE: {
-          // Translate not-equals as an equality followed by a boolean not
-          auto eq = lowerBinaryLike<CmpOp, pcl::CmpEqOp>(b, cmp, llzkToPcl);
-          if (failed(eq)) {
-            res = eq;
-            break;
-          }
-          // Get the result from the `pcl::CmpEqOp` to pass into `Not`
-          auto eqRes = lookup(cmp.getResult(), llzkToPcl, cmp);
-          if (failed(eqRes)) {
+          // ne = ¬(a == b). Build the whole chain before mapping the result:
+          // rememberResult never overwrites, so mapping the eq first would
+          // permanently associate the result with the un-negated value.
+          auto lhs = lookup(cmp.getLhs(), llzkToPcl, cmp);
+          auto rhs = lookup(cmp.getRhs(), llzkToPcl, cmp);
+          if (failed(lhs) || failed(rhs)) {
             res = failure();
             break;
           }
           auto loc = cmp.getLoc();
-          auto not_op = b.create<pcl::NotOp>(loc, *eqRes);
-          // Associate the result of the llzk-op with the result of the pcl-not
+          auto eq = b.create<pcl::CmpEqOp>(loc, *lhs, *rhs);
+          auto not_op = b.create<pcl::NotOp>(loc, eq.getRes());
           rememberResult(cmp.getResult(), not_op.getResult(), llzkToPcl);
           break;
         }
@@ -971,8 +1013,9 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         b.create<pcl::ReturnOp>(
             ret.getLoc(), (llvm::SmallVector<Value>(outVars.begin(), outVars.end()))
         );
-      }).Default([](Operation *unknown) {
+      }).Default([&res](Operation *unknown) {
         unknown->emitError("unsupported op in PCL lowering: ") << unknown->getName();
+        res = failure();
       });
       if (failed(res)) {
         return failure();

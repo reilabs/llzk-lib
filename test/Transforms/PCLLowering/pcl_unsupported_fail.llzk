@@ -1,0 +1,22 @@
+// REQUIRES: with-pcl
+// RUN: llzk-opt -I %S -llzk-to-pcl -verify-diagnostics %s
+// RUN: not llzk-opt -I %S -llzk-to-pcl %s 2>/dev/null
+
+// An op the lowering does not understand must fail the pass (second RUN
+// line): continuing would silently drop the constraint the op carries.
+module attributes {llzk.lang} {
+  struct.def @Unsupported {
+    struct.member @out : !felt.type<"koalabear"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) -> !struct.type<@Unsupported> {
+      %self = struct.new : <@Unsupported>
+      function.return %self : !struct.type<@Unsupported>
+    }
+    function.def @constrain(%self: !struct.type<@Unsupported>, %a: !felt.type<"koalabear">, %b: !felt.type<"koalabear">) attributes {function.allow_constraint, function.allow_non_native_field_ops} {
+      // expected-error@+1 {{unsupported op in PCL lowering: felt.pow}}
+      %0 = felt.pow %a, %b : !felt.type<"koalabear">, !felt.type<"koalabear">
+      %r = struct.readm %self[@out] : !struct.type<@Unsupported>, !felt.type<"koalabear">
+      constrain.eq %0, %r : !felt.type<"koalabear">, !felt.type<"koalabear">
+      function.return
+    }
+  }
+}
