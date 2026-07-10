@@ -155,19 +155,18 @@ static SmallVector<Value> decomposeBits(
     OpBuilder &b, Location loc, Value pclValue, const llvm::APInt &prime,
     llvm::function_ref<std::string()> nameGen, unsigned width
 ) {
-  unsigned n = width;
-  assert(n >= 1 && n <= prime.getActiveBits() && "width must be in [1, bits(prime)]");
+  assert(width >= 1 && width <= prime.getActiveBits() && "width must be in [1, bits(prime)]");
   auto *ctx = b.getContext();
   unsigned constBits = prime.getActiveBits() + 1;
   auto zeroConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 0)));
   auto oneConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1)));
 
   SmallVector<Value> bits;
-  bits.reserve(n);
+  bits.reserve(width);
   Value acc = zeroConst.getRes();
   llvm::APInt weight(constBits, 1);
 
-  for (unsigned i = 0; i < n; ++i) {
+  for (unsigned i = 0; i < width; ++i) {
     auto bit = b.create<pcl::VarOp>(loc, nameGen(), /*is_output=*/false);
     bits.push_back(bit.getRes());
 
@@ -187,7 +186,7 @@ static SmallVector<Value> decomposeBits(
   auto eq = b.create<pcl::CmpEqOp>(loc, acc, pclValue);
   b.create<pcl::AssertOp>(loc, eq.getRes());
 
-  if (n < prime.getActiveBits()) {
+  if (width < prime.getActiveBits()) {
     return bits;
   }
 
@@ -199,7 +198,7 @@ static SmallVector<Value> decomposeBits(
   // final `strictLess == 1` assert catches that case.
   Value strictLess = zeroConst.getRes();
   Value stillEqual = oneConst.getRes();
-  for (int i = n - 1; i >= 0; --i) {
+  for (int i = width - 1; i >= 0; --i) {
     Value bit = bits[i];
     auto complement = b.create<pcl::SubOp>(loc, oneConst.getRes(), bit);
     if (prime[i]) {
@@ -364,20 +363,40 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
           .create<pcl::ConstOp>(loc, pcl::FeltAttr::get(b.getContext(), llvm::APInt(constBits, v)))
           .getRes();
     };
+    // Decomposition width of a constant.
+    auto constWidth = [](const llvm::APInt &c) { return std::max(1u, c.getActiveBits()); };
+    // Reads bit `i` of a decomposition, treating bits past its width as
+    // constant zero; `zero` memoizes the constant across calls.
+    auto bitAt = [&](Location loc, ArrayRef<Value> bits, unsigned i, Value &zero) -> Value {
+      if (i < bits.size()) {
+        return bits[i];
+      }
+      if (!zero) {
+        zero = feltConst(loc, 0);
+      }
+      return zero;
+    };
 
     // Proven upper bounds (in bits) on values, from constants, range-guard
     // asserts, and propagation through lowered ops. Bounds must be implied by
     // already-emitted constraints or by op semantics, because a decomposition
     // at width `w` re-asserts `value < 2^w`; a wrong bound would reject honest
-    // witnesses. Missing entry means full field width.
+    // witnesses. Missing entry means full field width; the tightest bound wins.
     llvm::DenseMap<Value, unsigned> widthBound;
     auto setBound = [&](Value llzkVal, unsigned bits) {
-      widthBound[llzkVal] = std::max(1u, std::min(bits, fullWidth));
+      bits = std::max(1u, std::min(bits, fullWidth));
+      if (bits == fullWidth) {
+        return;
+      }
+      auto [it, inserted] = widthBound.try_emplace(llzkVal, bits);
+      if (!inserted && bits < it->second) {
+        it->second = bits;
+      }
     };
     auto boundOf = [&](Value llzkVal) -> unsigned {
       if (auto it = llzkToPcl.find(llzkVal); it != llzkToPcl.end()) {
         if (auto c = getPclConstAPInt(it->second)) {
-          return std::max(1u, c->getActiveBits());
+          return constWidth(*c);
         }
       }
       if (auto it = widthBound.find(llzkVal); it != widthBound.end()) {
@@ -386,37 +405,110 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       return fullWidth;
     };
 
+    // Bits may only be cached (reused as a value's decomposition) when their
+    // weighted sum is provably < p: any sum of fewer than fullWidth bits is
+    // < 2^(fullWidth−1) < p. At full width the sum of mixed bits can exceed
+    // p, in which case the bits describe a non-canonical representative of
+    // the mod-p result.
+    auto canCacheBits = [&](size_t numBits) { return numBits < fullWidth; };
+
     // Cache of checked bit decompositions, keyed by PCL value (low bit first).
     // Bitwise ops also record their results' bits (boolean by construction),
     // so chains of bitwise ops only decompose their leaves. Constants get a
-    // literal 0/1 bit vector with no assertions. Returns a copy because
-    // rehashing may relocate cached vectors.
-    llvm::DenseMap<Value, SmallVector<Value>> bitsCache;
-    auto getBits = [&](Location loc, Value llzkVal, Value pclVal) -> SmallVector<Value> {
+    // literal 0/1 bit vector with no assertions. Vectors live in `bitsStorage`
+    // so returned refs survive later cache insertions.
+    std::deque<SmallVector<Value>> bitsStorage;
+    llvm::DenseMap<Value, SmallVector<Value> *> bitsCache;
+    auto getBits = [&](Location loc, Value llzkVal) -> ArrayRef<Value> {
+      Value pclVal = llzkToPcl.lookup(llzkVal);
+      assert(pclVal && "operand must be lowered before getBits");
       auto [it, inserted] = bitsCache.try_emplace(pclVal);
       if (inserted) {
+        SmallVector<Value> &bits = bitsStorage.emplace_back();
         if (auto c = getPclConstAPInt(pclVal)) {
-          unsigned w = std::max(1u, c->getActiveBits());
-          for (unsigned i = 0; i < w; ++i) {
-            it->second.push_back(feltConst(loc, (*c)[i] ? 1 : 0));
+          for (unsigned i = 0, w = constWidth(*c); i < w; ++i) {
+            bits.push_back(feltConst(loc, (*c)[i] ? 1 : 0));
           }
         } else {
-          it->second = decomposeBits(b, loc, pclVal, prime, getNondetVarName, boundOf(llzkVal));
+          bits = decomposeBits(b, loc, pclVal, prime, getNondetVarName, boundOf(llzkVal));
         }
+        it->second = &bits;
       }
-      return it->second;
+      return *it->second;
     };
     auto cacheResultBits = [&](Value llzkResult, Value pclResult, SmallVector<Value> bits) {
-      // Only cache when the weighted sum of the bits is provably < p (any
-      // sum of fewer than fullWidth bits is < 2^(fullWidth−1) < p). At full
-      // width the sum of mixed bits can exceed p, in which case the bits
-      // describe a non-canonical representative of the mod-p result and must
-      // not be reused as its decomposition.
-      if (bits.size() >= fullWidth) {
+      if (!canCacheBits(bits.size())) {
         return;
       }
       setBound(llzkResult, bits.size());
-      bitsCache[pclResult] = std::move(bits);
+      bitsStorage.push_back(std::move(bits));
+      bitsCache[pclResult] = &bitsStorage.back();
+    };
+    // Recomposes a slice of a checked decomposition as `llzkResult`'s value;
+    // an empty slice is the constant 0. The slice becomes the result's bits.
+    auto emitBitSlice = [&](Location loc, Value llzkResult, ArrayRef<Value> slice) {
+      Value result;
+      if (slice.empty()) {
+        result = feltConst(loc, 0);
+      } else {
+        result = recomposeBits(b, loc, slice);
+        cacheResultBits(llzkResult, result, SmallVector<Value>(slice));
+      }
+      rememberResult(llzkResult, result, llzkToPcl);
+    };
+
+    // Range guards: noir_llzk pins blackbox input widths by asserting
+    // `cmp_lt(x, c) == 1` (with the bool cast to felt) before use; the guard
+    // proves `x < c`, so later decompositions of `x` fit in bits(c−1) instead
+    // of the full field width. Harvested over the whole block before lowering
+    // because PCL constraints form one conjunction: a guard bounds `x`
+    // wherever it appears, not just downstream of it.
+    auto constAt = [](Value v) -> std::optional<llvm::APInt> {
+      if (auto c = llvm::dyn_cast_if_present<FeltConstantOp>(v.getDefiningOp())) {
+        return c.getValue().getValue();
+      }
+      if (auto c = llvm::dyn_cast_if_present<mlir::arith::ConstantOp>(v.getDefiningOp())) {
+        if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
+          return intAttr.getValue();
+        }
+      }
+      return std::nullopt;
+    };
+    auto harvestRangeGuard = [&](Value cmpSide, Value trueSide) {
+      auto trueConst = constAt(trueSide);
+      if (!trueConst || !trueConst->isOne()) {
+        return;
+      }
+      // Look through `cast.tofelt`; noir_llzk casts the bool before
+      // constraining it against the felt constant 1.
+      if (auto castOp = llvm::dyn_cast_if_present<IntToFeltOp>(cmpSide.getDefiningOp())) {
+        cmpSide = castOp.getValue();
+      }
+      auto cmp = llvm::dyn_cast_if_present<CmpOp>(cmpSide.getDefiningOp());
+      if (!cmp) {
+        return;
+      }
+      auto pred = cmp.getPredicate();
+      Value bounded;
+      std::optional<llvm::APInt> limit;
+      if (pred == FeltCmpPredicate::LT || pred == FeltCmpPredicate::LE) {
+        bounded = cmp.getLhs();
+        limit = constAt(cmp.getRhs());
+      } else if (pred == FeltCmpPredicate::GT || pred == FeltCmpPredicate::GE) {
+        bounded = cmp.getRhs();
+        limit = constAt(cmp.getLhs());
+      } else {
+        return;
+      }
+      if (!limit) {
+        return;
+      }
+      bool strict = pred == FeltCmpPredicate::LT || pred == FeltCmpPredicate::GT;
+      if (strict && limit->isZero()) {
+        return;
+      }
+      llvm::APInt maxVal = strict ? *limit - 1 : *limit;
+      setBound(bounded, maxVal.getActiveBits());
     };
 
     // Shared scaffolding for bitwise binary felt ops. Operands may have
@@ -436,23 +528,14 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         return failure();
       }
       auto loc = op.getLoc();
-      SmallVector<Value> lb = getBits(loc, op.getLhs(), *lhs);
-      SmallVector<Value> rb = getBits(loc, op.getRhs(), *rhs);
+      ArrayRef<Value> lb = getBits(loc, op.getLhs());
+      ArrayRef<Value> rb = getBits(loc, op.getRhs());
       unsigned n = truncateToMin ? std::min(lb.size(), rb.size()) : std::max(lb.size(), rb.size());
       Value zero;
-      auto bitAt = [&](SmallVector<Value> &bits, unsigned i) -> Value {
-        if (i < bits.size()) {
-          return bits[i];
-        }
-        if (!zero) {
-          zero = feltConst(loc, 0);
-        }
-        return zero;
-      };
       SmallVector<Value> ob;
       ob.reserve(n);
       for (unsigned i = 0; i < n; ++i) {
-        ob.push_back(mix(loc, bitAt(lb, i), bitAt(rb, i)));
+        ob.push_back(mix(loc, bitAt(loc, lb, i, zero), bitAt(loc, rb, i, zero)));
       }
       Value result = recomposeBits(b, loc, ob);
       rememberResult(op.getResult(), result, llzkToPcl);
@@ -470,21 +553,12 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         return failure();
       }
       auto loc = op.getLoc();
-      SmallVector<Value> ab = getBits(loc, op.getOperand(), *operand);
+      ArrayRef<Value> ab = getBits(loc, op.getOperand());
       Value zero;
       SmallVector<Value> ob;
       ob.reserve(fullWidth);
       for (unsigned i = 0; i < fullWidth; ++i) {
-        Value bit;
-        if (i < ab.size()) {
-          bit = ab[i];
-        } else {
-          if (!zero) {
-            zero = feltConst(loc, 0);
-          }
-          bit = zero;
-        }
-        ob.push_back(mix(loc, bit));
+        ob.push_back(mix(loc, bitAt(loc, ab, i, zero)));
       }
       Value result = recomposeBits(b, loc, ob);
       rememberResult(op.getResult(), result, llzkToPcl);
@@ -511,21 +585,11 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       auto loc = op.getLoc();
       auto *ctx = b.getContext();
 
-      unsigned wideBits = 2 * fullWidth + 4;
-      llvm::APInt primeWide = prime.zext(wideBits);
-
       if (auto shift = getPclConstAPInt(*rhs)) {
-        // 2^s mod p by square-and-multiply over the bits of `s`.
-        llvm::APInt pow2s(wideBits, 1);
-        llvm::APInt sq = llvm::APInt(wideBits, 2).urem(primeWide);
-        for (unsigned i = 0, e = shift->getActiveBits(); i < e; ++i) {
-          if ((*shift)[i]) {
-            pow2s = (pow2s * sq).urem(primeWide);
-          }
-          sq = (sq * sq).urem(primeWide);
-        }
-        auto pow2sConst =
-            b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, pow2s.trunc(constBits)));
+        llvm::APInt pow2s = toExactWidthAPInt(
+            modExp(llvm::DynamicAPInt(2), toDynamicAPInt(*shift), toDynamicAPInt(prime)), constBits
+        );
+        auto pow2sConst = b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, pow2s));
         Value result = b.create<pcl::MulOp>(loc, *lhs, pow2sConst.getRes()).getRes();
         rememberResult(op.getResult(), result, llzkToPcl);
         unsigned s = shift->getLimitedValue(fullWidth);
@@ -533,19 +597,21 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         // Reuse `a`'s cached bits shifted up by `s` when the product can't
         // wrap mod p, so downstream bitwise ops skip a decomposition.
         if (auto it = bitsCache.find(*lhs);
-            it != bitsCache.end() && it->second.size() + s < fullWidth) {
+            it != bitsCache.end() && canCacheBits(it->second->size() + s)) {
           SmallVector<Value> shifted;
-          shifted.reserve(it->second.size() + s);
-          for (unsigned i = 0; i < s; ++i) {
-            shifted.push_back(feltConst(loc, 0));
+          shifted.reserve(it->second->size() + s);
+          if (s > 0) {
+            shifted.assign(s, feltConst(loc, 0));
           }
-          shifted.append(it->second.begin(), it->second.end());
+          shifted.append(it->second->begin(), it->second->end());
           cacheResultBits(op.getResult(), result, std::move(shifted));
         }
         return success();
       }
 
-      auto bBits = getBits(loc, op.getRhs(), *rhs);
+      unsigned wideBits = 2 * fullWidth + 4;
+      llvm::APInt primeWide = prime.zext(wideBits);
+      ArrayRef<Value> bBits = getBits(loc, op.getRhs());
       Value oneConst = feltConst(loc, 1);
       llvm::APInt curPow2 = llvm::APInt(wideBits, 2).urem(primeWide);
 
@@ -579,41 +645,32 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       auto loc = op.getLoc();
 
       if (auto shift = getPclConstAPInt(*rhs)) {
-        SmallVector<Value> aBitsVec = getBits(loc, op.getLhs(), *lhs);
-        unsigned s = shift->getLimitedValue(aBitsVec.size());
-        ArrayRef<Value> slice = ArrayRef<Value>(aBitsVec).drop_front(s);
-        Value result;
-        if (slice.empty()) {
-          result = feltConst(loc, 0);
-        } else {
-          result = recomposeBits(b, loc, slice);
-          cacheResultBits(op.getResult(), result, SmallVector<Value>(slice));
-        }
-        rememberResult(op.getResult(), result, llzkToPcl);
+        ArrayRef<Value> aBits = getBits(loc, op.getLhs());
+        unsigned s = shift->getLimitedValue(aBits.size());
+        emitBitSlice(loc, op.getResult(), aBits.drop_front(s));
         return success();
       }
 
-      unsigned n = fullWidth;
-      unsigned L = (n > 1) ? llvm::APInt(32, n - 1).getActiveBits() : 0;
+      unsigned L = (fullWidth > 1) ? llvm::APInt(32, fullWidth - 1).getActiveBits() : 0;
 
-      SmallVector<Value> aBits = getBits(loc, op.getLhs(), *lhs);
-      SmallVector<Value> bBits = getBits(loc, op.getRhs(), *rhs);
+      ArrayRef<Value> aBits = getBits(loc, op.getLhs());
+      ArrayRef<Value> bBits = getBits(loc, op.getRhs());
 
       Value zeroConst = feltConst(loc, 0);
       Value oneConst = feltConst(loc, 1);
-      // Pad `a`'s bits to full width with constant zeros; `b`'s bits beyond
-      // its decomposition width are implicitly zero.
-      aBits.resize(n, zeroConst);
 
       // Barrel shifter over `L` levels: at level i, conditionally shift right
       // by 2^i controlled by bBits[i]. Positions past the top become 0.
+      // `a`'s bits are padded to full width with constant zeros; `b`'s bits
+      // beyond its decomposition width are implicitly zero.
       SmallVector<Value> cur(aBits.begin(), aBits.end());
+      cur.resize(fullWidth, zeroConst);
       for (unsigned i = 0; i < L && i < bBits.size(); ++i) {
         unsigned shift = 1u << i;
         Value ctrl = bBits[i];
-        SmallVector<Value> next(n);
-        for (unsigned j = 0; j < n; ++j) {
-          Value neighbor = (j + shift < n) ? cur[j + shift] : zeroConst;
+        SmallVector<Value> next(fullWidth);
+        for (unsigned j = 0; j < fullWidth; ++j) {
+          Value neighbor = (j + shift < fullWidth) ? cur[j + shift] : zeroConst;
           auto diff = b.create<pcl::SubOp>(loc, neighbor, cur[j]);
           auto scaled = b.create<pcl::MulOp>(loc, ctrl, diff.getRes());
           next[j] = b.create<pcl::AddOp>(loc, cur[j], scaled.getRes()).getRes();
@@ -628,7 +685,7 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
         auto complement = b.create<pcl::SubOp>(loc, oneConst, bBits[i]);
         inRange = b.create<pcl::MulOp>(loc, inRange, complement.getRes()).getRes();
       }
-      for (unsigned j = 0; j < n; ++j) {
+      for (unsigned j = 0; j < fullWidth; ++j) {
         cur[j] = b.create<pcl::MulOp>(loc, inRange, cur[j]).getRes();
       }
 
@@ -639,11 +696,8 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
     // `v · w == 1` pins `w` to the unique inverse and is unsatisfiable for
     // `v == 0`, matching the dialect's requirement that divisors be non-zero.
     auto emitInverse = [&](Location loc, Value v) -> Value {
-      auto *ctx = b.getContext();
-      unsigned constBits = prime.getActiveBits() + 1;
       auto w = b.create<pcl::VarOp>(loc, getNondetVarName(), /*is_output=*/false);
-      Value oneConst =
-          b.create<pcl::ConstOp>(loc, pcl::FeltAttr::get(ctx, llvm::APInt(constBits, 1))).getRes();
+      Value oneConst = feltConst(loc, 1);
       auto prod = b.create<pcl::MulOp>(loc, v, w.getRes());
       auto eq = b.create<pcl::CmpEqOp>(loc, prod.getRes(), oneConst);
       b.create<pcl::AssertOp>(loc, eq.getRes());
@@ -672,19 +726,12 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       }
       unsigned s = divisor->logBase2();
       auto loc = op.getLoc();
-      SmallVector<Value> bits = getBits(loc, op.getLhs(), *lhs);
+      ArrayRef<Value> bits = getBits(loc, op.getLhs());
       // A shift of the value's full width or more leaves no quotient bits.
       unsigned split = std::min<unsigned>(s, bits.size());
-      ArrayRef<Value> slice = wantQuotient ? ArrayRef<Value>(bits).drop_front(split)
-                                           : ArrayRef<Value>(bits).take_front(split);
-      Value result;
-      if (slice.empty()) {
-        result = feltConst(loc, 0);
-      } else {
-        result = recomposeBits(b, loc, slice);
-        cacheResultBits(op.getResult(), result, SmallVector<Value>(slice));
-      }
-      rememberResult(op.getResult(), result, llzkToPcl);
+      emitBitSlice(
+          loc, op.getResult(), wantQuotient ? bits.drop_front(split) : bits.take_front(split)
+      );
       return success();
     };
 
@@ -714,6 +761,12 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
       );
     }
     Block &srcEntry = srcFunc.getBody().front();
+    for (Operation &op : srcEntry) {
+      if (auto eq = llvm::dyn_cast<EmitEqualityOp>(&op)) {
+        harvestRangeGuard(eq.getLhs(), eq.getRhs());
+        harvestRangeGuard(eq.getRhs(), eq.getLhs());
+      }
+    }
     // Translate each op. Almost 1-1 and currently only support Felt/Bool ops.
     // TODO: Support calls, if-else, globals/lookups.
     for (Operation &op : srcEntry) {
@@ -896,61 +949,11 @@ class PassImpl : public pcl::conversion::impl::PCLLoweringPassBase<PassImpl> {
           return;
         }
 
-        Value lhsVal = *lhs, rhsVal = *rhs;
         auto loc = eq.getLoc();
-        if (failed(emitAssertEqOptimized(b, loc, lhsVal, rhsVal))) {
+        if (failed(emitAssertEqOptimized(b, loc, *lhs, *rhs))) {
           res = failure();
           return;
         }
-
-        // Harvest range guards: asserting `cmp_lt(x, c) == true` (the pattern
-        // noir_llzk emits to pin blackbox input widths) proves `x < c`, which
-        // lets later decompositions of `x` use bits(c−1) instead of the full
-        // field width.
-        auto constAt = [&](Value llzkVal) -> std::optional<llvm::APInt> {
-          if (Value pclVal = llzkToPcl.lookup(llzkVal)) {
-            return getPclConstAPInt(pclVal);
-          }
-          return std::nullopt;
-        };
-        auto harvest = [&](Value cmpSide, Value trueSide) {
-          auto trueConst = constAt(trueSide);
-          if (!trueConst || !trueConst->isOne()) {
-            return;
-          }
-          // Look through `cast.tofelt`; noir_llzk casts the bool before
-          // constraining it against the felt constant 1.
-          if (auto castOp = llvm::dyn_cast_if_present<IntToFeltOp>(cmpSide.getDefiningOp())) {
-            cmpSide = castOp.getValue();
-          }
-          auto cmp = llvm::dyn_cast_if_present<CmpOp>(cmpSide.getDefiningOp());
-          if (!cmp) {
-            return;
-          }
-          auto pred = cmp.getPredicate();
-          Value bounded;
-          std::optional<llvm::APInt> limit;
-          if (pred == FeltCmpPredicate::LT || pred == FeltCmpPredicate::LE) {
-            bounded = cmp.getLhs();
-            limit = constAt(cmp.getRhs());
-          } else if (pred == FeltCmpPredicate::GT || pred == FeltCmpPredicate::GE) {
-            bounded = cmp.getRhs();
-            limit = constAt(cmp.getLhs());
-          } else {
-            return;
-          }
-          if (!limit) {
-            return;
-          }
-          bool strict = pred == FeltCmpPredicate::LT || pred == FeltCmpPredicate::GT;
-          if (strict && limit->isZero()) {
-            return;
-          }
-          llvm::APInt maxVal = strict ? *limit - 1 : *limit;
-          setBound(bounded, maxVal.getActiveBits());
-        };
-        harvest(eq.getLhs(), eq.getRhs());
-        harvest(eq.getRhs(), eq.getLhs());
       })
           .Case<MemberReadOp>([&member2pclvar, &llzkToPcl, &srcFunc](auto read) {
         // At this point every member in the struct should have a var associated with it
